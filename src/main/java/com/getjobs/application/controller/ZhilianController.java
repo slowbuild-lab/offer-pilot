@@ -14,7 +14,6 @@ import org.springframework.web.bind.annotation.*;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.concurrent.CompletableFuture;
 import java.util.stream.Collectors;
 
 /**
@@ -52,6 +51,12 @@ public class ZhilianController {
         if (config == null) {
             config = new ZhilianConfigEntity();
         }
+        if (config.getPopupDelaySeconds() == null) {
+            config.setPopupDelaySeconds(5);
+        }
+
+        if (config.getMaxAttemptsPerTask() == null) config.setMaxAttemptsPerTask(20);
+        if (config.getMaxAttemptsPerDay() == null) config.setMaxAttemptsPerDay(50);
 
         Map<String, List<Map<String, String>>> options = new HashMap<>();
         options.put("city", zhilianService.getOptionsByType("city").stream().map(e -> {
@@ -287,11 +292,14 @@ public class ZhilianController {
             }
 
             // 异步启动新任务
-            CompletableFuture.runAsync(() -> {
-                zhilianJobService.executeDelivery(progressMessage -> {
-                    log.info("[{}] {}", progressMessage.getPlatform(), progressMessage.getMessage());
-                });
-            });
+            boolean accepted = zhilianJobService.startDelivery(progressMessage ->
+                    log.info("[{}] {}", progressMessage.getPlatform(), progressMessage.getMessage()));
+            if (!accepted) {
+                response.put("success", false);
+                response.put("message", "任务已在启动或运行中");
+                response.put("status", "running");
+                return ResponseEntity.status(409).body(response);
+            }
 
             response.put("success", true);
             response.put("message", "智联招聘任务启动成功");
@@ -318,7 +326,7 @@ public class ZhilianController {
         Map<String, Object> response = new HashMap<>();
 
         try {
-            if (!zhilianJobService.isRunning()) {
+            if (!zhilianJobService.isRunning() && !zhilianJobService.isPaused()) {
                 response.put("success", false);
                 response.put("message", "没有正在运行的智联招聘任务");
                 return ResponseEntity.badRequest().body(response);
