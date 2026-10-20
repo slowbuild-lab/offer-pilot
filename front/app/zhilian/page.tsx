@@ -1,6 +1,6 @@
 'use client'
 
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useRef } from 'react'
 import { createSSEWithBackoff } from '@/lib/sse'
 import { BiLogOut, BiSave, BiBriefcase, BiPlay, BiStop } from 'react-icons/bi'
 import { Button } from '@/components/ui/button'
@@ -9,6 +9,7 @@ import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Select } from '@/components/ui/select'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
+import DeliverySafetyPanel, { type SafetyStatus } from './DeliverySafetyPanel'
 import AnalysisContent from '@/app/zhilian/analysis/AnalysisContent'
 import PageHeader from '@/app/components/PageHeader'
 import { API_BASE } from '@/lib/api'
@@ -18,6 +19,9 @@ interface ZhilianConfig {
   keywords?: string
   cityCode?: string
   salary?: string
+  popupDelaySeconds?: number | ''
+  maxAttemptsPerTask?: number | ''
+  maxAttemptsPerDay?: number | ''
 }
 
 interface Option { name: string; code: string }
@@ -26,6 +30,9 @@ interface ZhilianOptions { city: Option[] }
 export default function ZhilianPage() {
   const [isLoggedIn, setIsLoggedIn] = useState(false)
   const [isDelivering, setIsDelivering] = useState(false)
+  const [taskState, setTaskState] = useState('IDLE')
+  const [actionPending, setActionPending] = useState(false)
+  const controlPending = useRef(false)
   const [checkingLogin, setCheckingLogin] = useState(true)
   const [showLogoutDialog, setShowLogoutDialog] = useState(false)
   const [showSaveDialog, setShowSaveDialog] = useState(false)
@@ -34,9 +41,38 @@ export default function ZhilianPage() {
   const [logoutResult, setLogoutResult] = useState<{ success: boolean; message: string } | null>(null)
   const [backendAvailable, setBackendAvailable] = useState(true)
 
-  const [config, setConfig] = useState<ZhilianConfig>({ keywords: '', cityCode: '', salary: '' })
+  const [config, setConfig] = useState<ZhilianConfig>({ keywords: '', cityCode: '', salary: '', popupDelaySeconds: 5, maxAttemptsPerTask: 20, maxAttemptsPerDay: 50 })
   const [options, setOptions] = useState<ZhilianOptions>({ city: [] })
   const [loadingConfig, setLoadingConfig] = useState(true)
+  const [safetyStatus, setSafetyStatus] = useState<SafetyStatus>({})
+  const [deliveryMessage, setDeliveryMessage] = useState('')
+  const [deliveryMessageType, setDeliveryMessageType] = useState('info')
+
+  useEffect(() => {
+    let cancelled = false
+    const updateStatus = async () => {
+      try {
+        const response = await fetch(`${API_BASE}/api/zhilian/status`)
+        if (!response.ok) return
+        const status = await response.json()
+        if (cancelled) return
+        setSafetyStatus(status)
+        if (!controlPending.current) {
+          setIsDelivering(Boolean(status.isRunning))
+          setTaskState(status.taskState || (status.isRunning ? 'RUNNING' : 'IDLE'))
+        }
+        if (status.lastMessage) {
+          setDeliveryMessage(status.lastMessage)
+          setDeliveryMessageType(status.lastMessageType || 'info')
+        }
+      } catch {
+        // A transient status request failure must not reset an active task.
+      }
+    }
+    updateStatus()
+    const timer = window.setInterval(updateStatus, 2000)
+    return () => { cancelled = true; window.clearInterval(timer) }
+  }, [])
 
   useEffect(() => {
     if (typeof window === 'undefined' || typeof EventSource === 'undefined') {
@@ -122,6 +158,9 @@ export default function ZhilianPage() {
       if (data.config) {
         const normalized = { ...data.config }
         normalized.keywords = parseKeywordsFromDb(data.config.keywords)
+        normalized.popupDelaySeconds = data.config.popupDelaySeconds ?? 5
+        normalized.maxAttemptsPerTask = data.config.maxAttemptsPerTask ?? 20
+        normalized.maxAttemptsPerDay = data.config.maxAttemptsPerDay ?? 50
         setConfig(normalized)
       }
       if (data.options) setOptions(data.options)
@@ -155,22 +194,44 @@ export default function ZhilianPage() {
   }, [])
 
   const handleStartDelivery = async () => {
+    if (controlPending.current) return
+    controlPending.current = true
+    setActionPending(true)
+    setTaskState('STARTING')
     try {
       setIsDelivering(true)
       const response = await fetch(`${API_BASE}/api/zhilian/start`, { method: 'POST' })
       const data = await response.json()
+      setDeliveryMessage(data.message || '投递任务已启动')
+      setDeliveryMessageType(data.success ? 'info' : 'error')
       if (!data.success) setIsDelivering(false)
     } catch (error) {
       setIsDelivering(false)
+      setDeliveryMessage('无法连接后端服务，请检查项目是否正常运行')
+      setDeliveryMessageType('error')
+    } finally {
+      controlPending.current = false
+      setActionPending(false)
     }
   }
 
   const handleStopDelivery = async () => {
+    if (controlPending.current) return
+    controlPending.current = true
+    setActionPending(true)
     try {
       const response = await fetch(`${API_BASE}/api/zhilian/stop`, { method: 'POST' })
       const data = await response.json()
-      if (data.success) setIsDelivering(false)
-    } catch (error) {}
+      if (data.success) setTaskState('STOPPING')
+      setDeliveryMessage(data.message || '停止请求已发送')
+      setDeliveryMessageType(data.success ? 'info' : 'error')
+    } catch {
+      setDeliveryMessage('停止请求未确认，请检查连接后重试')
+      setDeliveryMessageType('error')
+    } finally {
+      controlPending.current = false
+      setActionPending(false)
+    }
   }
 
   const triggerLogout = async () => {
@@ -199,6 +260,19 @@ export default function ZhilianPage() {
   }
 
   const handleSaveConfig = async () => {
+    for (const value of [config.maxAttemptsPerTask, config.maxAttemptsPerDay]) {
+      if (typeof value !== 'number' || !Number.isInteger(value) || value < 1 || value > 500) {
+        setSaveResult({ success: false, message: '投递尝试上限必须为 1 到 500 的整数。' })
+        setShowSaveDialog(true)
+        return
+      }
+    }
+    const delay = config.popupDelaySeconds
+    if (typeof delay !== 'number' || !Number.isInteger(delay) || delay < 0 || delay > 300) {
+      setSaveResult({ success: false, message: '投递成功后等待秒数必须为 0 到 300 的整数。' })
+      setShowSaveDialog(true)
+      return
+    }
     try {
       const payload = { ...config, keywords: serializeKeywordsForDb(config.keywords) }
       const response = await fetch(`${API_BASE}/api/zhilian/config`, {
@@ -239,12 +313,14 @@ export default function ZhilianPage() {
               <Button size="sm" disabled className="rounded-full bg-gray-300 text-gray-600 cursor-not-allowed px-4 shadow">
                 <BiPlay className="mr-1" /> 请先登录智联招聘
               </Button>
+            ) : taskState === 'PAUSED' ? (
+              <Button onClick={handleStopDelivery} disabled={actionPending} size="sm">结束暂停任务</Button>
             ) : isDelivering ? (
-              <Button onClick={handleStopDelivery} size="sm" className="rounded-full bg-gradient-to-r from-red-500 to-rose-600 hover:from-red-600 hover:to-rose-700 text-white px-4 shadow-lg hover:shadow-xl transition-all duration-300 hover:scale-105">
-                <BiStop className="mr-1" /> 停止投递
+              <Button onClick={handleStopDelivery} disabled={actionPending || taskState === 'STOPPING'} size="sm" className="rounded-full bg-gradient-to-r from-red-500 to-rose-600 hover:from-red-600 hover:to-rose-700 text-white px-4 shadow-lg hover:shadow-xl transition-all duration-300 hover:scale-105">
+                <BiStop className="mr-1" /> {taskState === 'STOPPING' ? '正在停止…' : taskState === 'STARTING' ? '停止启动' : '停止投递'}
               </Button>
             ) : (
-              <Button onClick={handleStartDelivery} size="sm" className="rounded-full bg-gradient-to-r from-teal-500 to-green-500 hover:from-teal-600 hover:to-green-600 text-white px-4 shadow-lg hover:shadow-xl transition-all duration-300 hover:scale-105">
+              <Button onClick={handleStartDelivery} disabled={actionPending} size="sm" className="rounded-full bg-gradient-to-r from-teal-500 to-green-500 hover:from-teal-600 hover:to-green-600 text-white px-4 shadow-lg hover:shadow-xl transition-all duration-300 hover:scale-105">
                 <BiPlay className="mr-1" /> 开始投递
               </Button>
             )}
@@ -257,6 +333,21 @@ export default function ZhilianPage() {
           </div>
         }
       />
+
+      {deliveryMessage && (
+        <div role="status" aria-live="polite" className={`rounded-lg border p-4 text-sm ${
+          deliveryMessageType === 'error' || deliveryMessageType === 'warning'
+            ? 'border-amber-300 bg-amber-50 text-amber-900 dark:bg-amber-950 dark:text-amber-100'
+            : 'border-blue-200 bg-blue-50 text-blue-900 dark:bg-blue-950 dark:text-blue-100'
+        }`}>
+          {deliveryMessage}
+        </div>
+      )}
+
+      <DeliverySafetyPanel status={safetyStatus} isRunning={isDelivering} onMessage={(message, error) => {
+        setDeliveryMessage(message)
+        setDeliveryMessageType(error ? 'error' : 'info')
+      }} />
 
       <Tabs defaultValue="config" className="w-full">
         <TabsList className="grid w-full grid-cols-2">
@@ -275,8 +366,8 @@ export default function ZhilianPage() {
             <CardContent>
               <div className="space-y-4">
                 <p className="text-sm text-muted-foreground">请在浏览器标签页中登录智联招聘平台，登录成功后系统会自动检测登录状态。</p>
-                <p className="text-sm text-muted-foreground">登录成功后，点击"开始投递"按钮启动自动投递任务。</p>
-                <p className="text-sm text-muted-foreground">点击"保存配置"按钮可手动保存当前登录相关信息到数据库。</p>
+                <p className="text-sm text-muted-foreground">登录成功后，点击“开始投递”按钮启动自动投递任务。</p>
+                <p className="text-sm text-muted-foreground">点击“保存配置”保存岗位条件、投递数量上限与等待时间。</p>
               </div>
             </CardContent>
           </Card>
@@ -321,6 +412,36 @@ export default function ZhilianPage() {
                       value={config.salary || ''}
                       onChange={(e) => setConfig((c) => ({ ...c, salary: e.target.value }))}
                     />
+                  </div>
+                  {([
+                    ['maxAttemptsPerTask', '本次最多尝试投递', 20],
+                    ['maxAttemptsPerDay', '每日最多尝试投递', 50],
+                  ] as const).map(([field, label, fallback]) => (
+                    <div key={field} className="space-y-2">
+                      <Label htmlFor={field}>{label}</Label>
+                      <Input id={field} type="number" min={1} max={500} step={1}
+                        aria-describedby="attempt-limit-help" value={config[field] ?? fallback}
+                        onChange={(e) => setConfig((c) => ({ ...c, [field]: e.target.value === '' ? '' : e.target.valueAsNumber }))} />
+                    </div>
+                  ))}
+                  <p id="attempt-limit-help" className="text-sm text-muted-foreground md:col-span-2">
+                    上限为 1–500 次。按本工具发起的尝试计数，结果待核实也占次数；跳过不计数。每日按北京时间重置，不包含网页手动投递；保存后新任务生效。
+                  </p>
+                  <div className="space-y-2">
+                    <Label htmlFor="popup-delay-seconds">投递成功后等待（秒）</Label>
+                    <Input
+                      id="popup-delay-seconds"
+                      type="number"
+                      min={0}
+                      max={300}
+                      step={1}
+                      aria-describedby="popup-delay-help"
+                      value={config.popupDelaySeconds ?? 5}
+                      onChange={(e) => setConfig((c) => ({ ...c, popupDelaySeconds: e.target.value === '' ? '' : e.target.valueAsNumber }))}
+                    />
+                    <p id="popup-delay-help" className="text-sm text-muted-foreground">
+                      成功弹窗出现后，等待设定秒数再点击“留在此页”并处理下一岗位。可设置 0–300 秒，默认 5 秒；保存后从下一次启动任务生效。
+                    </p>
                   </div>
                 </div>
               )}
