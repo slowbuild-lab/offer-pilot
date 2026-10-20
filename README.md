@@ -1,4 +1,13 @@
 <h1 align="center">🍀 Get Jobs【工作无忧】</h1>
+
+> **本仓库是智联招聘增强版 Fork，由 `slowbuild-lab` 维护。**
+>
+> 基于原项目 [loks666/get_jobs](https://github.com/loks666/get_jobs) 的 `a78db87` 版本，新增智联滚动加载、成功弹窗等待配置、单次／每日次数控制、历史去重、待核实记录和异常暂停等功能。
+>
+> **[查看相对原项目的新增功能与使用说明](ENHANCEMENTS.md)** · [macOS 本机启动说明](本机运行说明.md)
+>
+> 下方保留原项目介绍与授权信息；其中 AI 匹配、图片简历、BOSS 重复沟通等是原项目已有功能，不是本 Fork 新增。
+
 <div align="center">
 
 [![Stars](https://img.shields.io/github/stars/loks666/get_jobs?style=flat&label=🌟stars&labelColor=ff4f4f&color=ff8383)](https://github.com/loks666/get_jobs)
@@ -41,7 +50,8 @@
 
 ### 🌴源码地址
 
-- Github (国外访问)：https://github.com/loks666/get_jobs
+- 本智联增强版：https://github.com/slowbuild-lab/offer-pilot
+- 原项目 Github：https://github.com/loks666/get_jobs
 - Gitee·码云 (中国大陆)：https://gitee.com/lok666/get_jobs
 
 ### 📢 广告位招租
@@ -78,7 +88,7 @@
 ### 1️⃣ 使用git拉取代码
 
 ```
-git clone https://github.com/loks666/get_jobs.git
+git clone https://github.com/slowbuild-lab/offer-pilot.git
 cd get_jobs
 ```
 
