@@ -28,6 +28,19 @@ public class ZhilianConfig {
      */
     private String salary;
 
+    /** 投递成功弹窗出现后等待的秒数。 */
+    private Integer popupDelaySeconds;
+
+    public Integer getPopupDelaySeconds() {
+        return popupDelaySeconds == null ? 5 : popupDelaySeconds;
+    }
+
+
+    private Integer maxAttemptsPerTask;
+    private Integer maxAttemptsPerDay;
+
+    public Integer getMaxAttemptsPerTask() { return maxAttemptsPerTask == null ? 20 : maxAttemptsPerTask; }
+    public Integer getMaxAttemptsPerDay() { return maxAttemptsPerDay == null ? 50 : maxAttemptsPerDay; }
 
     // 注意：已改为在 ZhilianJobService 中通过 ConfigService 构建配置
     // 保留空的 init 以兼容旧调用，但建议不要再使用

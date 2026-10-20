@@ -11,6 +11,8 @@ import com.getjobs.worker.zhilian.ZhilianConfig;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
+import org.springframework.http.HttpStatus;
+import org.springframework.web.server.ResponseStatusException;
 
 import java.time.LocalDateTime;
 import java.util.ArrayList;
@@ -20,6 +22,7 @@ import jakarta.annotation.PostConstruct;
 import javax.sql.DataSource;
 import java.sql.Connection;
 import java.sql.Statement;
+import java.sql.ResultSet;
 import java.util.*;
 import java.util.stream.Collectors;
 
@@ -36,7 +39,13 @@ public class ZhilianService {
     public ZhilianConfigEntity getFirstConfig() {
         QueryWrapper<ZhilianConfigEntity> wrapper = new QueryWrapper<>();
         wrapper.last("LIMIT 1");
-        return zhilianConfigMapper.selectOne(wrapper);
+        ZhilianConfigEntity config = zhilianConfigMapper.selectOne(wrapper);
+        if (config != null && config.getPopupDelaySeconds() == null) {
+            config.setPopupDelaySeconds(5);
+        }
+        if (config != null && config.getMaxAttemptsPerTask() == null) config.setMaxAttemptsPerTask(20);
+        if (config != null && config.getMaxAttemptsPerDay() == null) config.setMaxAttemptsPerDay(50);
+        return config;
     }
 
     /** 从专表构建 ZhilianConfig */
@@ -53,6 +62,9 @@ public class ZhilianService {
 
         // 关键词解析：支持逗号或括号列表
         config.setKeywords(parseListString(entity.getKeywords()));
+        config.setPopupDelaySeconds(entity.getPopupDelaySeconds());
+        config.setMaxAttemptsPerTask(entity.getMaxAttemptsPerTask());
+        config.setMaxAttemptsPerDay(entity.getMaxAttemptsPerDay());
 
         // 城市：中文名映射到代码；缺省或“不限”映射为 0
         String city = safeTrim(entity.getCityCode());
@@ -109,6 +121,7 @@ public class ZhilianService {
      */
     public ZhilianConfigEntity updateConfig(ZhilianConfigEntity config) {
         if (config == null) return null;
+        validatePopupDelay(config);
         if (config.getId() != null) {
             zhilianConfigMapper.updateById(config);
             return zhilianConfigMapper.selectById(config.getId());
@@ -120,6 +133,7 @@ public class ZhilianService {
      * 保存或选择性更新第一条记录（仅覆盖非空字段）
      */
     public ZhilianConfigEntity saveOrUpdateFirstSelective(ZhilianConfigEntity incoming) {
+        validatePopupDelay(incoming);
         ZhilianConfigEntity first = getFirstConfig();
         java.time.LocalDateTime now = java.time.LocalDateTime.now();
         if (first == null) {
@@ -127,6 +141,9 @@ public class ZhilianService {
             toInsert.setKeywords(incoming.getKeywords());
             toInsert.setCityCode(incoming.getCityCode());
             toInsert.setSalary(incoming.getSalary());
+            toInsert.setPopupDelaySeconds(incoming.getPopupDelaySeconds() == null ? 5 : incoming.getPopupDelaySeconds());
+            toInsert.setMaxAttemptsPerTask(incoming.getMaxAttemptsPerTask() == null ? 20 : incoming.getMaxAttemptsPerTask());
+            toInsert.setMaxAttemptsPerDay(incoming.getMaxAttemptsPerDay() == null ? 50 : incoming.getMaxAttemptsPerDay());
             toInsert.setCreatedAt(now);
             toInsert.setUpdatedAt(now);
             zhilianConfigMapper.insert(toInsert);
@@ -137,10 +154,25 @@ public class ZhilianService {
             if (incoming.getKeywords() != null) toUpdate.setKeywords(incoming.getKeywords());
             if (incoming.getCityCode() != null) toUpdate.setCityCode(incoming.getCityCode());
             if (incoming.getSalary() != null) toUpdate.setSalary(incoming.getSalary());
+            if (incoming.getPopupDelaySeconds() != null) toUpdate.setPopupDelaySeconds(incoming.getPopupDelaySeconds());
+            toUpdate.setMaxAttemptsPerTask(incoming.getMaxAttemptsPerTask());
+            toUpdate.setMaxAttemptsPerDay(incoming.getMaxAttemptsPerDay());
             toUpdate.setCreatedAt(first.getCreatedAt());
             toUpdate.setUpdatedAt(now);
             zhilianConfigMapper.updateById(toUpdate);
             return zhilianConfigMapper.selectById(first.getId());
+        }
+    }
+
+    private void validatePopupDelay(ZhilianConfigEntity config) {
+        for (Integer limit : new Integer[]{config.getMaxAttemptsPerTask(), config.getMaxAttemptsPerDay()}) {
+            if (limit != null && (limit < 1 || limit > 500)) {
+                throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "投递尝试上限必须为 1 到 500 的整数");
+            }
+        }
+        Integer delay = config.getPopupDelaySeconds();
+        if (delay != null && (delay < 0 || delay > 300)) {
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "投递成功后等待秒数必须为 0 到 300 的整数");
         }
     }
 
@@ -182,6 +214,7 @@ public class ZhilianService {
 
     @PostConstruct
     public void ensureZhilianDataTableExists() {
+        ensureZhilianConfigTableExists();
         String createSql = "CREATE TABLE IF NOT EXISTS zhilian_data (" +
                 " id INTEGER PRIMARY KEY AUTOINCREMENT," +
                 " job_id VARCHAR(64)," +
@@ -201,6 +234,37 @@ public class ZhilianService {
             log.info("确保 zhilian_data 表已存在");
         } catch (Exception e) {
             log.warn("创建 zhilian_data 表失败: {}", e.getMessage());
+        }
+    }
+
+    /** 原地补齐旧库字段，保留已有关键词、城市和薪资设置。 */
+    private void ensureZhilianConfigTableExists() {
+        try (Connection conn = dataSource.getConnection(); Statement stmt = conn.createStatement()) {
+            stmt.execute("CREATE TABLE IF NOT EXISTS zhilian_config (" +
+                    "id INTEGER PRIMARY KEY AUTOINCREMENT, keywords TEXT, city_code TEXT, salary TEXT," +
+                    "popup_delay_seconds INTEGER DEFAULT 5, created_at DATETIME, updated_at DATETIME)");
+            boolean hasPopupDelay = false;
+            try (ResultSet columns = stmt.executeQuery("PRAGMA table_info(zhilian_config)")) {
+                while (columns.next()) {
+                    if ("popup_delay_seconds".equals(columns.getString("name"))) {
+                        hasPopupDelay = true;
+                        break;
+                    }
+                }
+            }
+            for (String column : List.of("max_attempts_per_task", "max_attempts_per_day")) {
+                boolean present = false;
+                try (ResultSet columns = stmt.executeQuery("PRAGMA table_info(zhilian_config)")) {
+                    while (columns.next()) if (column.equals(columns.getString("name"))) present = true;
+                }
+                if (!present) stmt.execute("ALTER TABLE zhilian_config ADD COLUMN " + column
+                        + " INTEGER DEFAULT " + (column.endsWith("task") ? 20 : 50));
+            }
+            if (!hasPopupDelay) {
+                stmt.execute("ALTER TABLE zhilian_config ADD COLUMN popup_delay_seconds INTEGER DEFAULT 5");
+            }
+        } catch (Exception e) {
+            throw new IllegalStateException("初始化智联配置表失败", e);
         }
     }
 
