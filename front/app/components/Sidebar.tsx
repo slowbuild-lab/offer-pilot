@@ -3,12 +3,13 @@
 import Link from 'next/link'
 import { usePathname } from 'next/navigation'
 import { useEffect, useState } from 'react'
-import { BiEnvelope, BiBriefcase, BiSearch, BiTask, BiUserCircle, BiBrain, BiMoon, BiSun } from 'react-icons/bi'
+import { BiEnvelope, BiBriefcase, BiSearch, BiTask, BiUserCircle, BiBrain, BiMoon, BiSun, BiHomeSmile } from 'react-icons/bi'
 import { motion } from 'framer-motion'
 import { useTheme } from 'next-themes'
 import { API_BASE } from '@/lib/api'
 
 export default function Sidebar() {
+  const [mobileOpen, setMobileOpen] = useState(false)
   const pathname = usePathname()
   const { theme, setTheme } = useTheme()
   const [mounted, setMounted] = useState(false)
@@ -65,6 +66,8 @@ export default function Sidebar() {
   }, [])
 
   const envGroup = [
+    { href: '/job-profile', icon: BiUserCircle, label: '求职方案', color: 'text-cyan-300' },
+    { href: '/delivery-records', icon: BiTask, label: '投递记录与额度', color: 'text-cyan-300' },
     { href: '/env-config', icon: BiEnvelope, label: '环境配置', color: 'text-cyan-300' },
     { href: '/ai-config', icon: BiBrain, label: 'AI配置', color: 'text-purple-300' },
   ]
@@ -77,11 +80,18 @@ export default function Sidebar() {
   ]
 
   return (
+    <>
+    <button type="button" aria-controls="app-sidebar" aria-expanded={mobileOpen}
+      onClick={() => setMobileOpen(value => !value)}
+      className="fixed left-3 top-3 z-[60] rounded border bg-background px-3 py-2 text-foreground md:hidden">
+      {mobileOpen ? '关闭导航' : '打开导航'}
+    </button>
     <motion.div
+      id="app-sidebar"
       initial={{ x: -100, opacity: 0 }}
       animate={{ x: 0, opacity: 1 }}
       transition={{ duration: 0.5, ease: "easeOut" }}
-      className="fixed left-0 top-0 h-full w-64 bg-gradient-to-b from-blue-600 via-indigo-600 to-purple-600 dark:from-blacksection dark:via-blackho dark:to-black shadow-solid-8 z-50 border-r border-white/10 dark:border-strokedark"
+      className={`${mobileOpen ? 'block' : 'hidden'} md:block fixed left-0 top-0 h-full w-64 bg-gradient-to-b from-blue-600 via-indigo-600 to-purple-600 dark:from-blacksection dark:via-blackho dark:to-black shadow-solid-8 z-50 border-r border-white/10 dark:border-strokedark`}
     >
       {/* 侧边栏头部 */}
       <motion.div
@@ -94,7 +104,7 @@ export default function Sidebar() {
           <span className="text-4xl leading-none">🍀</span>
           <div>
             <h1 className="text-xl font-bold text-white">Get Jobs</h1>
-            <p className="text-white dark:text-manatee text-sm">配置管理中心</p>
+            <p className="text-white dark:text-manatee text-sm">求职作战台</p>
           </div>
         </div>
 
@@ -147,7 +157,32 @@ export default function Sidebar() {
       </motion.div>
 
       {/* 导航菜单 */}
-      <nav className="p-4 space-y-4 overflow-y-auto h-[calc(100vh-280px)]">
+      <nav onClick={() => setMobileOpen(false)} className="p-4 space-y-4 overflow-y-auto h-[calc(100vh-280px)]">
+        {/* 总览分组 */}
+        <div>
+          <div className="px-4 py-2 text-white dark:text-waterloo text-xs uppercase tracking-wide">总览</div>
+          <div className="space-y-2">
+            <motion.div initial={{ x: -20, opacity: 0 }} animate={{ x: 0, opacity: 1 }} transition={{ duration: 0.3 }}>
+              <Link
+                href="/"
+                className={`
+                  group flex items-center gap-3 px-4 py-3 rounded-xl transition-all duration-300
+                  ${pathname === '/'
+                    ? 'bg-white/25 dark:bg-white/5 text-white shadow-solid-3 backdrop-blur-sm border-l-4 border-cyan-300'
+                    : 'text-white dark:text-manatee hover:bg-white/15 dark:hover:bg-white/5 hover:translate-x-1'
+                  }
+                `}
+              >
+                <BiHomeSmile className={`text-xl ${pathname === '/' ? 'text-cyan-300' : 'text-indigo-300'} group-hover:scale-110 transition-transform`} />
+                <span className="font-medium">作战台</span>
+                {pathname === '/' && (
+                  <div className="ml-auto"><div className="w-2 h-2 bg-cyan-300 rounded-full animate-pulse"></div></div>
+                )}
+              </Link>
+            </motion.div>
+          </div>
+        </div>
+
         {/* 环境配置分组 */}
         <div>
           <div className="px-4 py-2 text-white dark:text-waterloo text-xs uppercase tracking-wide">环境配置</div>
@@ -238,5 +273,6 @@ export default function Sidebar() {
         </div>
       </motion.div>
     </motion.div>
+    </>
   )
 }

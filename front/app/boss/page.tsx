@@ -12,8 +12,11 @@ import { Label } from '@/components/ui/label'
 import { Select } from '@/components/ui/select'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import PageHeader from '@/app/components/PageHeader'
+import ParallelStatus from '@/app/components/ParallelStatus'
+import PreflightDialog from '@/app/components/PreflightDialog'
 import AnalysisContent from '@/app/boss/analysis/AnalysisContent'
 import { API_BASE } from '@/lib/api'
+import { runPreflight, type PreflightResult } from '@/lib/preflight'
 
 interface BossConfig {
   id?: number
@@ -113,6 +116,12 @@ export default function BossPage() {
   const [loading, setLoading] = useState(true)
   const [isLoggedIn, setIsLoggedIn] = useState(false)
   const [isDelivering, setIsDelivering] = useState(false)
+  const [taskState, setTaskState] = useState('IDLE')
+  const [taskMessage, setTaskMessage] = useState('')
+  const [taskMessageType, setTaskMessageType] = useState('info')
+  const [loginOpening, setLoginOpening] = useState(false)
+  const [stoppingSince, setStoppingSince] = useState<number | null>(null)
+  const [preflight, setPreflight] = useState<PreflightResult | null>(null)
   const [checkingLogin, setCheckingLogin] = useState(true)
   const [showLogoutDialog, setShowLogoutDialog] = useState(false)
   const [showSaveDialog, setShowSaveDialog] = useState(false)
@@ -148,14 +157,39 @@ export default function BossPage() {
     }
   }, [showResumePreview])
 
+  const refreshStatus = useCallback(async () => {
+    try {
+      const response = await fetch(`${API_BASE}/api/boss/status`)
+      if (!response.ok) return
+      const status = await response.json()
+      const state: string = status.taskState || (status.isRunning ? 'RUNNING' : 'IDLE')
+      setTaskState(state)
+      setIsDelivering(state === 'STARTING' || state === 'RUNNING' || state === 'STOPPING')
+      setIsLoggedIn(Boolean(status.isLoggedIn))
+      setCheckingLogin(false)
+      if (status.lastMessage) {
+        setTaskMessage(status.lastMessage)
+        setTaskMessageType(status.lastMessageType || 'info')
+      }
+      setStoppingSince(state === 'STOPPING' ? (prev => prev ?? Date.now()) : null)
+    } catch {
+      // 状态请求失败不能把正在运行的任务画成空闲
+    }
+  }, [])
+
   useEffect(() => {
     fetchAllData()
+
+    // 任务状态以后端为准：刷新页面或换设备后仍然显示真实状态，
+    // 并且只有后端真正退出 RUNNING/STOPPING 才把按钮恢复成"开始投递"。
+    void refreshStatus()
+    const statusTimer = window.setInterval(refreshStatus, 2000)
 
     // 确保在客户端环境且 EventSource 可用
     if (typeof window === 'undefined' || typeof EventSource === 'undefined') {
       console.warn('EventSource 不可用，无法连接SSE')
       setCheckingLogin(false)
-      return
+      return () => { window.clearInterval(statusTimer) }
     }
 
     const client = createSSEWithBackoff(`${API_BASE}/api/jobs/login-status/stream`, {
@@ -198,6 +232,7 @@ export default function BossPage() {
     })
 
     return () => {
+      window.clearInterval(statusTimer)
       client.close()
     }
   }, [])
@@ -582,6 +617,17 @@ export default function BossPage() {
 
   const handleStartDelivery = async () => {
     try {
+      // 先把没登录/没配置/没额度查出来，避免点完才报错；WARN 只提示不阻止
+      const pre = await runPreflight('boss')
+      if (pre && !pre.ready) {
+        setPreflight(pre)
+        return
+      }
+      if (pre?.warnings?.length) {
+        setTaskMessage(`提示：${pre.warnings.join('；')}（不影响启动）`)
+        setTaskMessageType('warning')
+      }
+      setTaskState('STARTING')
       setIsDelivering(true)
       const response = await fetch(`${API_BASE}/api/boss/start`, {
         method: 'POST',
@@ -590,15 +636,17 @@ export default function BossPage() {
 
       if (data.success) {
         // 启动成功：不弹框，进度通过 SSE 推送
+        setTaskMessage(data.message || 'Boss任务已启动')
+        setTaskMessageType('info')
       } else {
-        // 启动失败必须让用户看见。
-        // 之前这里只写 console.warn，后端返回"请先登录"或"任务已在运行中"时，
-        // 界面上一点反应都没有，看着就像按钮坏了。
+        // 启动失败必须让用户看见，包括并行上限和同平台重复启动
         console.warn('启动失败：', data.message)
         setSaveResult({ success: false, title: '启动失败', message: data.message || '启动投递失败，请查看后端日志' })
         setShowSaveDialog(true)
-        setIsDelivering(false)
+        setTaskMessage(data.message || '启动投递失败')
+        setTaskMessageType('error')
       }
+      await refreshStatus()
     } catch (error) {
       console.error('Failed to start delivery:', error)
       setSaveResult({
@@ -608,6 +656,7 @@ export default function BossPage() {
       })
       setShowSaveDialog(true)
       setIsDelivering(false)
+      setTaskState('IDLE')
     }
   }
 
@@ -617,19 +666,51 @@ export default function BossPage() {
         method: 'POST',
       })
       const data = await response.json()
-
-      if (data.success) {
-        // 停止成功：不弹框
-        setIsDelivering(false)
+      // 停止请求发出后保持"停止中"，由状态轮询确认任务真正退出
+      if (response.ok && data.success) {
+        setTaskState('STOPPING')
+        setStoppingSince(Date.now())
+        setTaskMessage(data.message || '停止请求已发送')
+        setTaskMessageType('warning')
       } else {
-        // 停止失败：也要将状态设置为未投递（因为可能任务已经结束）
-        console.warn('停止失败：', data.message)
-        setIsDelivering(false)
+        setTaskMessage(data.message || '停止请求未被接受')
+        setTaskMessageType('error')
       }
+      await refreshStatus()
     } catch (error) {
       console.error('Failed to stop delivery:', error)
-      // 停止失败：也要将状态设置为未投递
-      setIsDelivering(false)
+      setTaskMessage('停止请求未确认，请检查网络后重试')
+      setTaskMessageType('error')
+    }
+  }
+
+  const handleOpenLogin = async () => {
+    if (loginOpening) return
+    setLoginOpening(true)
+    try {
+      const response = await fetch(`${API_BASE}/api/boss/login`, { method: 'POST' })
+      const data = await response.json()
+      setTaskMessage(data.message || '正在打开Boss登录窗口')
+      setTaskMessageType(data.success ? 'info' : 'error')
+    } catch {
+      setTaskMessage('无法打开Boss登录窗口，请检查后端服务')
+      setTaskMessageType('error')
+    } finally {
+      // 首次启动浏览器需要时间，稍后再放开按钮
+      window.setTimeout(() => setLoginOpening(false), 5000)
+    }
+  }
+
+  const handleForceStop = async () => {
+    try {
+      const response = await fetch(`${API_BASE}/api/boss/force-stop`, { method: 'POST' })
+      const data = await response.json()
+      setTaskMessage(data.message || '已请求强制结束')
+      setTaskMessageType('warning')
+      await refreshStatus()
+    } catch {
+      setTaskMessage('强制结束请求失败，请检查后端服务')
+      setTaskMessageType('error')
     }
   }
 
@@ -674,16 +755,26 @@ export default function BossPage() {
                 <BiPlay className="mr-1" /> 检查登录中...
               </Button>
             ) : !isLoggedIn ? (
-              <Button size="sm" disabled className="rounded-full bg-gray-300 text-gray-600 cursor-not-allowed px-4 shadow">
-                <BiPlay className="mr-1" /> 请先登录Boss
+              <Button onClick={handleOpenLogin} disabled={loginOpening} size="sm" className="rounded-full bg-gradient-to-r from-teal-500 to-green-500 hover:from-teal-600 hover:to-green-600 text-white px-4 shadow-lg">
+                <BiPlay className="mr-1" /> {loginOpening ? '正在打开浏览器…' : '打开浏览器登录'}
               </Button>
             ) : isDelivering ? (
-              <Button onClick={handleStopDelivery} size="sm" className="rounded-full bg-gradient-to-r from-red-500 to-rose-600 hover:from-red-600 hover:to-rose-700 text-white px-4 shadow-lg hover:shadow-xl transition-all duration-300 hover:scale-105">
-                <BiStop className="mr-1" /> 停止投递
+              <Button onClick={handleStopDelivery} disabled={taskState === 'STOPPING'} size="sm" className="rounded-full bg-gradient-to-r from-red-500 to-rose-600 hover:from-red-600 hover:to-rose-700 text-white px-4 shadow-lg hover:shadow-xl transition-all duration-300 hover:scale-105">
+                <BiStop className="mr-1" /> {taskState === 'STOPPING' ? '正在停止…' : taskState === 'STARTING' ? '停止启动' : '停止投递'}
               </Button>
             ) : (
               <Button onClick={handleStartDelivery} size="sm" className="rounded-full bg-gradient-to-r from-teal-500 to-green-500 hover:from-teal-600 hover:to-green-600 text-white px-4 shadow-lg hover:shadow-xl transition-all duration-300 hover:scale-105">
                 <BiPlay className="mr-1" /> 开始投递
+              </Button>
+            )}
+            {isLoggedIn && (
+              <Button onClick={handleOpenLogin} disabled={loginOpening} variant="outline" size="sm" className="rounded-full px-4">
+                {loginOpening ? '正在打开…' : '打开浏览器'}
+              </Button>
+            )}
+            {taskState === 'STOPPING' && stoppingSince && Date.now() - stoppingSince > 15000 && (
+              <Button onClick={handleForceStop} size="sm" variant="outline" className="rounded-full border-amber-500 text-amber-600 px-4">
+                强制结束（仅关闭Boss浏览器）
               </Button>
             )}
             <Button onClick={() => setShowLogoutDialog(true)} size="sm" className="rounded-full bg-gradient-to-r from-red-500 to-pink-500 hover:from-red-600 hover:to-pink-600 text-white px-4 shadow-lg hover:shadow-xl transition-all duration-300 hover:scale-105">
@@ -695,6 +786,18 @@ export default function BossPage() {
           </div>
         }
       />
+
+      <ParallelStatus />
+
+      {taskMessage && (
+        <div role="status" aria-live="polite" className={`rounded-lg border p-4 text-sm ${
+          taskMessageType === 'error' || taskMessageType === 'warning'
+            ? 'border-amber-300 bg-amber-50 text-amber-900 dark:bg-amber-950 dark:text-amber-100'
+            : 'border-blue-200 bg-blue-50 text-blue-900 dark:bg-blue-950 dark:text-blue-100'
+        }`}>
+          {taskMessage}
+        </div>
+      )}
 
       <Tabs defaultValue="config" className="w-full">
         <TabsList className="grid w-full grid-cols-2">
@@ -714,9 +817,9 @@ export default function BossPage() {
             </CardHeader>
             <CardContent>
               <div className="space-y-4">
-                <p className="text-sm text-muted-foreground">请在浏览器标签页中登录 Boss 直聘平台，登录成功后系统会自动检测登录状态。</p>
-                <p className="text-sm text-muted-foreground">登录成功后，点击“开始投递”按钮启动自动投递任务。</p>
-                <p className="text-sm text-muted-foreground">点击“保存配置”按钮可手动保存当前登录相关信息到数据库。</p>
+                <p className="text-sm text-muted-foreground">点击右上角“打开浏览器登录”，系统会为 BOSS 单独打开一个浏览器窗口（与智联、猎聘互不影响），登录成功后自动检测登录状态。</p>
+                <p className="text-sm text-muted-foreground">登录态优先复用数据库中保存的 BOSS Cookie；若提示未登录，说明登录已失效，需要在该窗口重新扫码。</p>
+                <p className="text-sm text-muted-foreground">登录成功后，点击“开始投递”按钮启动自动投递任务；BOSS 与智联可以同时投递，最多同时运行两个平台。</p>
               </div>
             </CardContent>
           </Card>
@@ -1294,6 +1397,17 @@ export default function BossPage() {
             </Card>
           </div>
         </div>
+      )}
+
+      {preflight && (
+        <PreflightDialog
+          result={preflight}
+          onClose={() => setPreflight(null)}
+          onLogin={() => {
+            setPreflight(null)
+            void handleOpenLogin()
+          }}
+        />
       )}
     </div>
   )

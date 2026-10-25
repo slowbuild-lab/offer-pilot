@@ -12,7 +12,10 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import DeliverySafetyPanel, { type SafetyStatus } from './DeliverySafetyPanel'
 import AnalysisContent from '@/app/zhilian/analysis/AnalysisContent'
 import PageHeader from '@/app/components/PageHeader'
+import ParallelStatus from '@/app/components/ParallelStatus'
+import PreflightDialog from '@/app/components/PreflightDialog'
 import { API_BASE } from '@/lib/api'
+import { runPreflight, type PreflightResult } from '@/lib/preflight'
 
 interface ZhilianConfig {
   id?: number
@@ -47,6 +50,9 @@ export default function ZhilianPage() {
   const [safetyStatus, setSafetyStatus] = useState<SafetyStatus>({})
   const [deliveryMessage, setDeliveryMessage] = useState('')
   const [deliveryMessageType, setDeliveryMessageType] = useState('info')
+  const [loginOpening, setLoginOpening] = useState(false)
+  const [stoppingSince, setStoppingSince] = useState<number | null>(null)
+  const [preflight, setPreflight] = useState<PreflightResult | null>(null)
 
   useEffect(() => {
     let cancelled = false
@@ -61,6 +67,9 @@ export default function ZhilianPage() {
           setIsDelivering(Boolean(status.isRunning))
           setTaskState(status.taskState || (status.isRunning ? 'RUNNING' : 'IDLE'))
         }
+        setStoppingSince((status.taskState === 'STOPPING')
+          ? (prev => prev ?? Date.now())
+          : null)
         if (status.lastMessage) {
           setDeliveryMessage(status.lastMessage)
           setDeliveryMessageType(status.lastMessageType || 'info')
@@ -197,8 +206,18 @@ export default function ZhilianPage() {
     if (controlPending.current) return
     controlPending.current = true
     setActionPending(true)
-    setTaskState('STARTING')
     try {
+      // 预检只读：把登录/配置/额度问题提前暴露；WARN 只提示，不阻止启动
+      const pre = await runPreflight('zhilian')
+      if (pre && !pre.ready) {
+        setPreflight(pre)
+        return
+      }
+      if (pre?.warnings?.length) {
+        setDeliveryMessage(`提示：${pre.warnings.join('；')}（不影响启动）`)
+        setDeliveryMessageType('warning')
+      }
+      setTaskState('STARTING')
       setIsDelivering(true)
       const response = await fetch(`${API_BASE}/api/zhilian/start`, { method: 'POST' })
       const data = await response.json()
@@ -234,8 +253,35 @@ export default function ZhilianPage() {
     }
   }
 
-  const triggerLogout = async () => {
+  const handleOpenLogin = async () => {
+    if (loginOpening) return
+    setLoginOpening(true)
     try {
+      const response = await fetch(`${API_BASE}/api/zhilian/login`, { method: 'POST' })
+      const data = await response.json()
+      setDeliveryMessage(data.message || '正在打开智联登录窗口')
+      setDeliveryMessageType(data.success ? 'info' : 'error')
+    } catch {
+      setDeliveryMessage('无法打开智联登录窗口，请检查后端服务')
+      setDeliveryMessageType('error')
+    } finally {
+      window.setTimeout(() => setLoginOpening(false), 5000)
+    }
+  }
+
+  const handleForceStop = async () => {
+    try {
+      const response = await fetch(`${API_BASE}/api/zhilian/force-stop`, { method: 'POST' })
+      const data = await response.json()
+      setDeliveryMessage(data.message || '已请求强制结束')
+      setDeliveryMessageType('warning')
+    } catch {
+      setDeliveryMessage('强制结束请求失败，请检查后端服务')
+      setDeliveryMessageType('error')
+    }
+  }
+
+  const triggerLogout = async () => {    try {
       const response = await fetch(`${API_BASE}/api/zhilian/logout`, { method: 'POST' })
       const data = await response.json()
       setIsLoggedIn(false)
@@ -310,8 +356,8 @@ export default function ZhilianPage() {
                 <BiPlay className="mr-1" /> 检查登录中...
               </Button>
             ) : !isLoggedIn ? (
-              <Button size="sm" disabled className="rounded-full bg-gray-300 text-gray-600 cursor-not-allowed px-4 shadow">
-                <BiPlay className="mr-1" /> 请先登录智联招聘
+              <Button onClick={handleOpenLogin} disabled={loginOpening} size="sm" className="rounded-full bg-gradient-to-r from-teal-500 to-green-500 hover:from-teal-600 hover:to-green-600 text-white px-4 shadow-lg">
+                <BiPlay className="mr-1" /> {loginOpening ? '正在打开浏览器…' : '打开浏览器登录'}
               </Button>
             ) : taskState === 'PAUSED' ? (
               <Button onClick={handleStopDelivery} disabled={actionPending} size="sm">结束暂停任务</Button>
@@ -327,12 +373,24 @@ export default function ZhilianPage() {
             <Button onClick={() => setShowLogoutDialog(true)} size="sm" className="rounded-full bg-gradient-to-r from-red-500 to-pink-500 hover:from-red-600 hover:to-pink-600 text-white px-4 shadow-lg hover:shadow-xl transition-all duration-300 hover:scale-105">
               <BiLogOut className="mr-1" /> 退出登录
             </Button>
+            {isLoggedIn && (
+              <Button onClick={handleOpenLogin} disabled={loginOpening} variant="outline" size="sm" className="rounded-full px-4">
+                {loginOpening ? '正在打开…' : '打开浏览器'}
+              </Button>
+            )}
+            {taskState === 'STOPPING' && stoppingSince && Date.now() - stoppingSince > 15000 && (
+              <Button onClick={handleForceStop} size="sm" variant="outline" className="rounded-full border-amber-500 text-amber-600 px-4">
+                强制结束（仅关闭智联浏览器）
+              </Button>
+            )}
             <Button onClick={handleSaveConfig} size="sm" className="rounded-full bg-gradient-to-r from-blue-500 to-indigo-500 hover:from-blue-600 hover:to-indigo-600 text-white px-4 shadow-lg hover:shadow-xl transition-all duration-300 hover:scale-105">
               <BiSave className="mr-1" /> 保存配置
             </Button>
           </div>
         }
       />
+
+      <ParallelStatus />
 
       {deliveryMessage && (
         <div role="status" aria-live="polite" className={`rounded-lg border p-4 text-sm ${
@@ -365,9 +423,9 @@ export default function ZhilianPage() {
             </CardHeader>
             <CardContent>
               <div className="space-y-4">
-                <p className="text-sm text-muted-foreground">请在浏览器标签页中登录智联招聘平台，登录成功后系统会自动检测登录状态。</p>
-                <p className="text-sm text-muted-foreground">登录成功后，点击“开始投递”按钮启动自动投递任务。</p>
-                <p className="text-sm text-muted-foreground">点击“保存配置”保存岗位条件、投递数量上限与等待时间。</p>
+                <p className="text-sm text-muted-foreground">点击右上角“打开浏览器登录”，系统会为智联单独打开一个浏览器窗口（与 BOSS、猎聘互不影响），登录成功后自动检测登录状态。</p>
+                <p className="text-sm text-muted-foreground">登录态优先复用数据库中保存的智联 Cookie；若提示未登录，说明登录已失效，需要在该窗口重新扫码。</p>
+                <p className="text-sm text-muted-foreground">登录成功后，点击“开始投递”按钮启动自动投递任务；智联与 BOSS 可以同时投递，最多同时运行两个平台。</p>
               </div>
             </CardContent>
           </Card>
@@ -508,6 +566,17 @@ export default function ZhilianPage() {
             </CardContent>
           </Card>
         </div>
+      )}
+
+      {preflight && (
+        <PreflightDialog
+          result={preflight}
+          onClose={() => setPreflight(null)}
+          onLogin={() => {
+            setPreflight(null)
+            void handleOpenLogin()
+          }}
+        />
       )}
     </div>
   )

@@ -22,7 +22,7 @@ export default function ContentArea({ children }: { children: ReactNode }) {
   }, [pathname])
 
   return (
-    <main className={`flex-1 ml-64 bg-background dark:bg-blacksection content-bg ${accentClass} min-h-screen`}>
+    <main className={`min-w-0 flex-1 ml-0 pt-12 md:ml-64 md:pt-0 bg-background dark:bg-blacksection content-bg ${accentClass} min-h-screen`}>
       <motion.div
         key={pathname}
         initial={{ opacity: 0, y: 20 }}
