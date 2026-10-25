@@ -148,6 +148,11 @@ fun findOnPath(name: String): File? {
 /** 本机 node 可执行文件路径，交给 Driver 用（PLAYWRIGHT_NODEJS_PATH） */
 fun resolveNodePath(): String? = findOnPath("node")?.absolutePath
 
+// Browser safety tests use disposable Chrome contexts and the already-installed driver.
+tasks.test {
+    resolveNodePath()?.let { environment("PLAYWRIGHT_NODEJS_PATH", it) }
+}
+
 // ---------------------------------------------------------------------------
 // 前端（管理页面）构建
 //

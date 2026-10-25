@@ -9,6 +9,8 @@ import com.getjobs.application.service.Job51Service;
 import com.getjobs.worker.manager.PlaywrightManager;
 // Boss 控制器已独立，移除 Boss 依赖
 import com.getjobs.worker.service.Job51JobService;
+import com.getjobs.worker.service.PlatformTaskCoordinator;
+import com.getjobs.worker.service.StartOutcome;
 import com.getjobs.worker.dto.JobProgressMessage;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -44,6 +46,7 @@ public class JobController {
     // Services / Managers
     private final Job51Service job51Service;
     private final Job51JobService job51JobService;
+    private final PlatformTaskCoordinator coordinator;
     private final PlaywrightManager playwrightManager;
     private final CookieService cookieService;
 
@@ -389,20 +392,17 @@ public class JobController {
                 response.put("status", "not_logged_in");
                 return ResponseEntity.badRequest().body(response);
             }
-            if (job51JobService.isRunning()) {
-                response.put("success", false);
-                response.put("message", "51job任务已在运行中，请等待当前任务完成");
-                response.put("status", "running");
-                return ResponseEntity.badRequest().body(response);
-            }
-            CompletableFuture.runAsync(() -> job51JobService.executeDelivery(pm -> {
+            StartOutcome outcome = coordinator.start("51job", pm -> {
                 // 推送到 SSE 并保留日志输出
                 sendJob51Progress(pm);
                 log.info("[{}] {}", pm.getPlatform(), pm.getMessage());
-            }));
-            response.put("success", true);
-            response.put("message", "51job任务启动成功");
-            response.put("status", "started");
+            });
+            response.put("success", outcome.accepted());
+            response.put("message", outcome.message());
+            response.put("status", outcome.status());
+            if (!outcome.accepted()) {
+                return ResponseEntity.status(409).body(response);
+            }
             log.info("通过API启动51job任务成功");
             return ResponseEntity.ok(response);
         } catch (Exception e) {
@@ -419,14 +419,13 @@ public class JobController {
     public ResponseEntity<Map<String, Object>> stop51jobJob() {
         Map<String, Object> response = new HashMap<>();
         try {
-            if (!job51JobService.isRunning()) {
-                response.put("success", false);
-                response.put("message", "没有正在运行的51job任务");
+            StartOutcome outcome = coordinator.stop("51job");
+            response.put("success", outcome.accepted());
+            response.put("status", outcome.status());
+            response.put("message", outcome.message());
+            if (!outcome.accepted()) {
                 return ResponseEntity.badRequest().body(response);
             }
-            job51JobService.stopDelivery();
-            response.put("success", true);
-            response.put("message", "51job任务停止请求已发送");
             log.info("通过API停止51job任务");
             return ResponseEntity.ok(response);
         } catch (Exception e) {

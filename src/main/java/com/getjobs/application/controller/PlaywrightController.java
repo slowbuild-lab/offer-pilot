@@ -14,8 +14,10 @@ import java.util.LinkedHashMap;
 import java.util.Map;
 
 /**
- * Playwright管理控制器
- * 用于测试和管理Playwright实例
+ * Playwright 诊断控制器。
+ *
+ * <p>浏览器现在按平台隔离，所以所有诊断都显式指定平台（默认 boss），
+ * 并且全部通过 {@link PlaywrightManager#callOn} 在对应平台的线程上执行。</p>
  */
 @RestController
 @RequestMapping("/api/playwright")
@@ -27,34 +29,29 @@ public class PlaywrightController {
         this.playwrightManager = playwrightManager;
     }
 
-    /**
-     * 获取Playwright状态信息
-     */
     @GetMapping("/status")
     public ResponseEntity<Map<String, Object>> getStatus() {
         Map<String, Object> status = new HashMap<>();
         status.put("initialized", playwrightManager.isInitialized());
         status.put("cdpPort", playwrightManager.getCdpPort());
         status.put("hasBossPage", playwrightManager.getBossPage() != null);
-        // 改用持久化上下文后没有独立的 Browser 对象，context 即代表浏览器本身
-        status.put("hasBrowser", playwrightManager.getContext() != null);
+        status.put("hasBrowser", playwrightManager.getContext("boss") != null);
         status.put("bossLoggedIn", playwrightManager.isLoggedIn("boss"));
-
+        status.put("platforms", playwrightManager.browserStatus());
         return ResponseEntity.ok(status);
     }
 
     /**
      * 指纹自检：确认当前浏览器有没有暴露自动化特征。
      * <p>
-     * 期望值：
-     * navigator.webdriver = false（真实 Chrome 就是 false，undefined 反而是老式 stealth 脚本的痕迹）；
-     * userAgentData 必须存在且 platform/brands 与 UA 自洽；cdc_ 残留为空。
+     * 期望值：navigator.webdriver = false；userAgentData 存在且与 UA 自洽；cdc_ 残留为空。
      */
     @GetMapping("/fingerprint")
-    public ResponseEntity<Map<String, Object>> fingerprint() {
+    public ResponseEntity<Map<String, Object>> fingerprint(
+            @RequestParam(value = "platform", defaultValue = "boss") String platform) {
         try {
-            // Playwright 调用必须走专用线程，不能直接在 http-nio 线程上调
-            Object raw = playwrightManager.callOnPlaywright(() -> playwrightManager.getBossPage().evaluate("""
+            playwrightManager.ensureReady(platform);
+            Object raw = playwrightManager.callOn(platform, page -> page.evaluate("""
                     () => {
                         const uaData = navigator.userAgentData;
                         return {
@@ -71,6 +68,7 @@ public class PlaywrightController {
                     }"""));
             Map<String, Object> result = new HashMap<>();
             result.put("success", true);
+            result.put("platform", platform);
             result.put("fingerprint", raw);
             return ResponseEntity.ok(result);
         } catch (Exception e) {
@@ -82,13 +80,11 @@ public class PlaywrightController {
     }
 
     /**
-     * 诊断：对比"常驻的 bossPage 标签页"和"新开的受控标签页"加载同一地址的表现。
-     * <p>
-     * 现象是 bossPage 一直转圈加载不完，但在同一个浏览器里手动新开标签页打开同样的地址却正常。
-     * 同浏览器同 profile 同指纹，差别只可能在标签页本身，这里把这个变量隔离出来。
+     * 诊断：在指定平台的会话里新开一个受控标签页，对比两个地址的加载表现。
      */
     @GetMapping("/diagnose")
     public ResponseEntity<Map<String, Object>> diagnose(
+            @RequestParam(value = "platform", defaultValue = "boss") String platform,
             @RequestParam(defaultValue = "https://www.zhipin.com/web/geek/jobs?query=Java&city=101020100") String url) {
         Map<String, Object> out = new LinkedHashMap<>();
         String probeJs = """
@@ -102,17 +98,16 @@ public class PlaywrightController {
                   pending: performance.getEntriesByType('resource')
                              .filter(r => r.responseEnd === 0).map(r => r.name).slice(0, 8)
                 })""";
-        // 刻意不碰常驻的 bossPage：它一旦卡在"永久加载"，evaluate 会无限期阻塞（没有默认超时），
-        // 整个诊断请求也会跟着挂死。这里只用全新的受控标签页做对照。
         String[] targets = {"https://www.zhipin.com", url};
         try {
-            playwrightManager.callOnPlaywright(() -> {
+            playwrightManager.ensureReady(platform);
+            playwrightManager.callOn(platform, page -> {
                 for (String target : targets) {
                     Map<String, Object> result = new LinkedHashMap<>();
                     Page probe = null;
                     long start = System.currentTimeMillis();
                     try {
-                        probe = playwrightManager.getContext().newPage();
+                        probe = page.context().newPage();
                         probe.setDefaultTimeout(20_000);
                         probe.navigate(target, new Page.NavigateOptions()
                                 .setTimeout(20_000)
@@ -138,6 +133,7 @@ public class PlaywrightController {
                 return null;
             });
             out.put("success", true);
+            out.put("platform", platform);
         } catch (Exception e) {
             out.put("success", false);
             out.put("error", e.getMessage());
@@ -145,20 +141,22 @@ public class PlaywrightController {
         return ResponseEntity.ok(out);
     }
 
-    /**
-     * 测试Boss导航功能
-     */
+    /** 测试导航：同样在所属平台的线程上执行 */
     @GetMapping("/test-navigate")
-    public ResponseEntity<Map<String, String>> testNavigate() {
+    public ResponseEntity<Map<String, String>> testNavigate(
+            @RequestParam(value = "platform", defaultValue = "boss") String platform) {
         try {
-            playwrightManager.getBossPage().navigate("https://www.zhipin.com");
-            String title = playwrightManager.getBossPage().title();
-
-            Map<String, String> result = new HashMap<>();
-            result.put("success", "true");
-            result.put("title", title);
-            result.put("url", playwrightManager.getBossPage().url());
-
+            playwrightManager.ensureReady(platform);
+            Map<String, String> result = playwrightManager.callOn(platform, page -> {
+                page.navigate("https://www.zhipin.com", new Page.NavigateOptions()
+                        .setTimeout(60_000)
+                        .setWaitUntil(WaitUntilState.DOMCONTENTLOADED));
+                Map<String, String> data = new HashMap<>();
+                data.put("success", "true");
+                data.put("title", page.title());
+                data.put("url", page.url());
+                return data;
+            });
             return ResponseEntity.ok(result);
         } catch (Exception e) {
             Map<String, String> error = new HashMap<>();

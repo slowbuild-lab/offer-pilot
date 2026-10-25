@@ -13,6 +13,7 @@ import java.util.Objects;
  */
 @Data
 public class ZhilianConfig {
+    private com.getjobs.application.service.JobProfileService.Snapshot confirmedProfile;
     /**
      * 搜索关键词列表
      */

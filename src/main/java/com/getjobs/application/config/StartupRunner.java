@@ -23,6 +23,10 @@ public class StartupRunner implements ApplicationRunner {
     @Value("${server.port:9527}")
     private int backendPort;
 
+    /** 验证/服务端场景下可以关掉"自动打开本机浏览器"，避免测试时弹窗 */
+    @Value("${getjobs.startup.open-browser:true}")
+    private boolean openBrowserEnabled;
+
     private static final int FRONTEND_PORT = 6866;
     private static final String FRONTEND_URL = "http://localhost:" + FRONTEND_PORT;
     private static final String BACKEND_URL = "http://localhost:";
@@ -32,14 +36,18 @@ public class StartupRunner implements ApplicationRunner {
 
     @Override
     public void run(ApplicationArguments args) throws Exception {
-        String urlToOpen = determineUrlToOpen();
-        if (urlToOpen != null) {
-            openBrowser(urlToOpen);
+        if (!openBrowserEnabled) {
+            log.info("已关闭自动打开本机浏览器（getjobs.startup.open-browser=false）");
         } else {
-            log.info("未找到可用的管理页面，跳过自动打开浏览器");
+            String urlToOpen = determineUrlToOpen();
+            if (urlToOpen != null) {
+                openBrowser(urlToOpen);
+            } else {
+                log.info("未找到可用的管理页面，跳过自动打开浏览器");
+            }
         }
 
-        // 在尝试打开管理页面之后，初始化 Playwright（满足“先打开管理页，再实例化”）
+        // 浏览器改为按平台按需启动：这里只做引擎自检，不打开任何浏览器窗口
         try {
             playwrightManager.init();
         } catch (Exception e) {

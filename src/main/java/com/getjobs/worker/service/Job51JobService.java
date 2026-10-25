@@ -42,16 +42,9 @@ public class Job51JobService implements JobPlatformService {
         }
 
         try {
-            // 浏览器可能已被手动关闭 / 崩溃，先确保可用，必要时重新拉起
+            // 浏览器可能已被手动关闭 / 崩溃，先确保可用；只启动/恢复 51job 自己的会话
             progressCallback.accept(JobProgressMessage.info(PLATFORM, "检查浏览器状态..."));
-            playwrightManager.ensureReady();
-
-            // 获取51job页面实例
-            Page page = playwrightManager.getJob51Page();
-            if (page == null) {
-                progressCallback.accept(JobProgressMessage.error(PLATFORM, "51job页面未初始化"));
-                return;
-            }
+            playwrightManager.ensureReady(PLATFORM);
 
             // 检查是否已登录
             if (!playwrightManager.isLoggedIn(PLATFORM)) {
@@ -64,7 +57,7 @@ public class Job51JobService implements JobPlatformService {
             shouldStop = false;
 
             // 暂停后台登录监控，避免与投递流程并发访问同一Page
-            playwrightManager.pause51jobMonitoring();
+            playwrightManager.pauseMonitoring(PLATFORM);
 
             // 加载配置（统一从 job51_config 专表读取）
             Job51Config config = configService.getJob51Config();
@@ -89,14 +82,16 @@ public class Job51JobService implements JobPlatformService {
             };
 
             Job51 job51 = job51Provider.getObject();
-            job51.setPage(page);
             job51.setConfig(config);
             job51.setProgressCallback(job51Callback);
             job51.setShouldStopCallback(this::shouldStop);
             job51.prepare();
 
-            // 必须跑在 Playwright 专用线程上，否则会和后台登录监控并发操作同一条连接
-            int deliveredCount = playwrightManager.callOnPlaywright(job51::execute);
+            // 跑在 51job 自己的会话线程上，和 BOSS/智联 的浏览器互不影响
+            int deliveredCount = playwrightManager.callOn(PLATFORM, page -> {
+                job51.setPage(page);
+                return job51.execute();
+            });
 
             progressCallback.accept(JobProgressMessage.success(PLATFORM,
                 String.format("投递任务完成，共投递%d个职位", deliveredCount)));
@@ -108,7 +103,7 @@ public class Job51JobService implements JobPlatformService {
             shouldStop = false;
             // 恢复后台登录监控
             try {
-                playwrightManager.resume51jobMonitoring();
+                playwrightManager.resumeMonitoring(PLATFORM);
             } catch (Exception ignored) {}
         }
     }

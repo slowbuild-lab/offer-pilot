@@ -5,6 +5,8 @@ import com.getjobs.application.service.CookieService;
 import com.getjobs.worker.dto.JobProgressMessage;
 import com.getjobs.worker.manager.PlaywrightManager;
 import com.getjobs.worker.service.BossJobService;
+import com.getjobs.worker.service.PlatformTaskCoordinator;
+import com.getjobs.worker.service.StartOutcome;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.catalina.connector.ClientAbortException;
@@ -34,6 +36,7 @@ public class BossController {
     private static final ObjectMapper objectMapper = new ObjectMapper();
 
     private final BossJobService bossJobService;
+    private final PlatformTaskCoordinator coordinator;
     private final PlaywrightManager playwrightManager;
     private final CookieService cookieService;
 
@@ -69,19 +72,7 @@ public class BossController {
     /** POST - 启动Boss投递任务 */
     @PostMapping("/execute")
     public ResponseEntity<Map<String, Object>> executeBoss() {
-        if (bossJobService.isRunning()) {
-            return ResponseEntity.ok(Map.of(
-                    "status", "already_running",
-                    "message", "Boss投递任务已在运行中"
-            ));
-        }
-
-        CompletableFuture.runAsync(() -> bossJobService.executeDelivery(this::sendBossProgress));
-
-        return ResponseEntity.ok(Map.of(
-                "status", "started",
-                "message", "Boss投递任务已启动"
-        ));
+        return startBoss();
     }
 
     /** POST - 启动Boss投递任务（前端使用的接口）*/
@@ -91,27 +82,20 @@ public class BossController {
         try {
             if (!playwrightManager.isLoggedIn("boss")) {
                 response.put("success", false);
-                response.put("message", "请先登录Boss直聘");
+                response.put("message", "请先登录Boss直聘（点击“打开浏览器登录”扫码）");
                 response.put("status", "not_logged_in");
                 return ResponseEntity.badRequest().body(response);
             }
-            if (bossJobService.isRunning()) {
-                long seconds = bossJobService.runningForMillis() / 1000;
-                response.put("success", false);
-                response.put("message", String.format(
-                        "Boss任务已在运行中（已运行 %d 分 %d 秒）。如果长时间没有进展，先点\"停止投递\"再重新开始",
-                        seconds / 60, seconds % 60));
-                response.put("status", "running");
-                response.put("runningSeconds", seconds);
-                return ResponseEntity.badRequest().body(response);
-            }
-            CompletableFuture.runAsync(() -> bossJobService.executeDelivery(pm -> {
+            StartOutcome outcome = coordinator.start("boss", pm -> {
                 sendBossProgress(pm);
                 log.info("[{}] {}", pm.getPlatform(), pm.getMessage());
-            }));
-            response.put("success", true);
-            response.put("message", "Boss任务启动成功");
-            response.put("status", "started");
+            });
+            response.put("success", outcome.accepted());
+            response.put("message", outcome.message());
+            response.put("status", outcome.status());
+            if (!outcome.accepted()) {
+                return ResponseEntity.status(409).body(response);
+            }
             log.info("通过API启动Boss任务成功");
             return ResponseEntity.ok(response);
         } catch (Exception e) {
@@ -123,19 +107,43 @@ public class BossController {
         }
     }
 
+    /** POST - 打开Boss浏览器扫码登录（异步，不阻塞接口） */
+    @PostMapping("/login")
+    public ResponseEntity<Map<String, Object>> loginBoss() {
+        try {
+            CompletableFuture.runAsync(() -> {
+                try {
+                    playwrightManager.triggerBossLogin();
+                } catch (Exception e) {
+                    log.error("打开Boss登录页失败", e);
+                }
+            });
+            return ResponseEntity.ok(Map.of(
+                    "success", true,
+                    "status", "opening",
+                    "message", "正在打开Boss独立浏览器窗口（首次启动约需 10-30 秒），请在窗口内扫码登录"
+            ));
+        } catch (Exception e) {
+            log.error("触发Boss登录失败", e);
+            return ResponseEntity.internalServerError().body(Map.of(
+                    "success", false,
+                    "message", "触发登录失败: " + e.getMessage()
+            ));
+        }
+    }
+
     /** POST - 停止Boss投递任务 */
     @PostMapping("/stop")
     public ResponseEntity<Map<String, Object>> stopBoss() {
         Map<String, Object> response = new HashMap<>();
         try {
-            if (!bossJobService.isRunning()) {
-                response.put("success", false);
-                response.put("message", "没有正在运行的Boss任务");
+            StartOutcome outcome = coordinator.stop("boss");
+            response.put("success", outcome.accepted());
+            response.put("status", outcome.status());
+            response.put("message", outcome.message());
+            if (!outcome.accepted()) {
                 return ResponseEntity.badRequest().body(response);
             }
-            bossJobService.stopDelivery();
-            response.put("success", true);
-            response.put("message", "Boss任务停止请求已发送");
             log.info("通过API停止Boss任务");
             return ResponseEntity.ok(response);
         } catch (Exception e) {
@@ -144,6 +152,17 @@ public class BossController {
             response.put("message", "停止Boss任务失败: " + e.getMessage());
             return ResponseEntity.internalServerError().body(response);
         }
+    }
+
+    /** POST - 强制结束：只关闭 Boss 自己的浏览器，智联/猎聘等其它平台不受影响 */
+    @PostMapping("/force-stop")
+    public ResponseEntity<Map<String, Object>> forceStopBoss() {
+        StartOutcome outcome = coordinator.forceStop("boss");
+        return ResponseEntity.ok(Map.of(
+                "success", outcome.accepted(),
+                "status", outcome.status(),
+                "message", outcome.message()
+        ));
     }
 
     /** POST - 退出Boss登录 */

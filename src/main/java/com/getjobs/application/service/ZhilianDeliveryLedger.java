@@ -25,6 +25,7 @@ public class ZhilianDeliveryLedger {
     private final DataSource dataSource;
     private final Clock clock;
     private final ObjectMapper json = new ObjectMapper();
+    @Autowired private DailyQuotaService quota;
 
     @Autowired
     public ZhilianDeliveryLedger(DataSource dataSource) { this(dataSource, Clock.systemUTC()); }
@@ -35,6 +36,7 @@ public class ZhilianDeliveryLedger {
 
     @PostConstruct
     public void initialize() {
+        if (quota == null) { quota = new DailyQuotaService(dataSource, clock); quota.initialize(); }
         transaction(c -> {
             execute(c, "CREATE TABLE IF NOT EXISTS zhilian_tasks (id TEXT PRIMARY KEY, config_json TEXT NOT NULL, " +
                     "task_limit INTEGER NOT NULL, day_limit INTEGER NOT NULL, state TEXT NOT NULL, reason TEXT, started_at INTEGER NOT NULL, block_day TEXT)");
@@ -66,12 +68,12 @@ public class ZhilianDeliveryLedger {
             boolean legacyDelivered = count(c, "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='zhilian_data'") > 0
                     && count(c, "SELECT count(*) FROM zhilian_data WHERE job_id=? AND delivery_status='已投递'", job.getJobId()) > 0;
             if (legacyDelivered || count(c, "SELECT count(*) FROM zhilian_attempts WHERE job_id=? AND " +
-                    "(task_id=? OR state IN ('RESERVED','SENT','UNKNOWN','CONFIRMED'))", job.getJobId(), taskId) > 0) {
+                    "(task_id=? OR state IN ('RESERVED','SENT','UNKNOWN','CONFIRMED','NOT_DELIVERED'))", job.getJobId(), taskId) > 0) {
                 return new Reservation(null, Decision.DUPLICATE);
             }
             if (count(c, "SELECT count(*) FROM zhilian_attempts WHERE task_id=? AND state!='RELEASED'", taskId)
                     >= ((Number) task.get("task_limit")).intValue()) return new Reservation(null, Decision.TASK_LIMIT);
-            if (dailyCount(c) >= ((Number) task.get("day_limit")).intValue()) return new Reservation(null, Decision.DAY_LIMIT);
+            if (dailyCount(c) >= quota.limit(c, "zhilian", ((Number) task.get("day_limit")).intValue())) return new Reservation(null, Decision.DAY_LIMIT);
             String id = UUID.randomUUID().toString();
             execute(c, "INSERT INTO zhilian_attempts VALUES (?,?,?,?,?,?,?,?,?,?)", id, taskId, job.getJobId(),
                     job.getJobTitle(), job.getCompanyName(), job.getJobLink(), "RESERVED", "", clock.millis(), day());
@@ -79,7 +81,20 @@ public class ZhilianDeliveryLedger {
         });
     }
 
-    public void markSent(String id) { transition(id, "RESERVED", "SENT", "即将点击投递，结果待确认"); }
+    public void markSent(String id) {
+        boolean allowed = transaction(c -> {
+            var attempt = row(c, "SELECT * FROM zhilian_attempts WHERE id=? AND state='RESERVED'", id);
+            int others = count(c, "SELECT count(*) FROM zhilian_attempts WHERE local_day=? AND state!='RELEASED' AND id!=?", day(), id);
+            int limit = quota.limit(c, "zhilian", 50);
+            if (others >= limit) {
+                execute(c, "UPDATE zhilian_attempts SET state='RELEASED',reason='提交前额度变化' WHERE id=?", id);
+                return false;
+            }
+            execute(c, "UPDATE zhilian_attempts SET state='SENT',local_day=?,reason='即将点击投递，结果待确认' WHERE id=?", day(), id);
+            return true;
+        });
+        if (!allowed) throw new DailyQuotaService.Exhausted();
+    }
     /** Only the caller immediately before click may use this: no browser click has been issued. */
     public void cancelBeforeClick(String id) { transition(id, "SENT", "RELEASED", "点击前已停止，未发起投递"); }
     public void confirm(String id) { transition(id, "SENT", "CONFIRMED", "页面已确认投递成功"); }
@@ -123,6 +138,16 @@ public class ZhilianDeliveryLedger {
         });
     }
 
+    /**
+     * 最近的智联任务，供作战台的"最近任务"列表使用（只读）。
+     * BOSS 目前没有任务账本，这里只返回智联的记录，不伪造其它平台的历史。
+     */
+    public List<Map<String, Object>> recentTasks(int limit) {
+        int size = Math.max(1, Math.min(50, limit));
+        return transaction(c -> rows(c, "SELECT id,state,reason,started_at AS startedAt FROM zhilian_tasks " +
+                "ORDER BY started_at DESC, rowid DESC LIMIT ?", size));
+    }
+
     public ZhilianConfig loadConfig(String taskId) {
         return transaction(c -> json.readValue((String) row(c, "SELECT config_json FROM zhilian_tasks WHERE id=?", taskId)
                 .get("config_json"), ZhilianConfig.class));
@@ -154,8 +179,12 @@ public class ZhilianDeliveryLedger {
         return transaction(c -> {
             Map<String, Object> result = new LinkedHashMap<>();
             int today = dailyCount(c);
-            result.put("todayAttempts", today);
-            result.put("remainingToday", Math.max(0, dayLimit - today));
+            int effective = quota.limit(c, "zhilian", dayLimit);
+            int reserved = count(c, "SELECT count(*) FROM zhilian_attempts WHERE local_day=? AND state='RESERVED'", day());
+            result.put("todayAttempts", today - reserved);
+            result.put("reservedCount", reserved);
+            result.put("effectiveLimit", effective);
+            result.put("remainingToday", Math.max(0, effective - today));
             result.put("attemptCount", count(c, "SELECT count(*) FROM zhilian_attempts WHERE task_id=? AND state!='RELEASED'", taskId));
             result.put("confirmedCount", count(c, "SELECT count(*) FROM zhilian_attempts WHERE task_id=? AND state='CONFIRMED'", taskId));
             result.put("unknownCount", count(c, "SELECT count(*) FROM zhilian_attempts WHERE state='UNKNOWN'"));
@@ -167,13 +196,33 @@ public class ZhilianDeliveryLedger {
     private int dailyCount(Connection c) throws SQLException {
         return count(c, "SELECT count(*) FROM zhilian_attempts WHERE local_day=? AND state!='RELEASED'", day());
     }
+    public List<Map<String,Object>> attempts(int page) {
+        if (page < 1 || page > 10000) throw new IllegalArgumentException("页码必须为 1 到 10000");
+        return transaction(c -> {
+            var found=rows(c,"SELECT a.*,t.config_json FROM zhilian_attempts a JOIN zhilian_tasks t ON t.id=a.task_id ORDER BY a.initiated_at DESC,a.rowid DESC LIMIT 20 OFFSET ?",(page-1)*20);
+            for (var item:found) {
+                Object raw=item.remove("config_json");
+                Long version=null;
+                if (raw!=null) {
+                    var node=json.readTree(raw.toString()).path("confirmedProfile").path("version");
+                    if (node.isIntegralNumber()) version=node.longValue();
+                }
+                item.put("profile_version",version);
+            }
+            return found;
+        });
+    }
     private String day() { return clock.instant().atZone(ZONE).toLocalDate().toString(); }
 
     private interface Work<T> { T run(Connection c) throws Exception; }
-    /** BEGIN IMMEDIATE serializes check-and-reserve even across different JDBC connections. */
+    /**
+     * BEGIN IMMEDIATE serializes check-and-reserve even across different JDBC connections.
+     * 多平台并行后这里会和其它平台的写入争锁，等待时间放宽到 15 秒；
+     * 等不到锁仍然抛 StorageException，由调用方停止投递，绝不吞掉数据库错误继续点投递。
+     */
     private <T> T transaction(Work<T> work) {
         try (Connection c = dataSource.getConnection()) {
-            try (Statement s = c.createStatement()) { s.execute("PRAGMA busy_timeout=5000"); s.execute("BEGIN IMMEDIATE"); }
+            try (Statement s = c.createStatement()) { s.execute("PRAGMA busy_timeout=15000"); s.execute("BEGIN IMMEDIATE"); }
             try {
                 T result = work.run(c);
                 try (Statement s = c.createStatement()) { s.execute("COMMIT"); }

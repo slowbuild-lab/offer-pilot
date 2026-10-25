@@ -2,6 +2,8 @@ package com.getjobs.application.controller;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.getjobs.application.service.ZhilianDeliveryLedger;
+import com.getjobs.worker.service.PlatformTaskCoordinator;
+import com.getjobs.worker.service.StartOutcome;
 import com.getjobs.worker.service.ZhilianJobService;
 import lombok.RequiredArgsConstructor;
 import org.springframework.http.ResponseEntity;
@@ -15,6 +17,7 @@ import java.util.Map;
 public class ZhilianSafetyController {
     private final ZhilianDeliveryLedger ledger;
     private final ZhilianJobService tasks;
+    private final PlatformTaskCoordinator coordinator;
 
     @GetMapping("/attempts/unknown")
     public ResponseEntity<?> unknown(@RequestParam(defaultValue = "1") int page) {
@@ -35,8 +38,11 @@ public class ZhilianSafetyController {
 
     @PostMapping("/resume")
     public ResponseEntity<?> resume() {
-        if (!tasks.resumeDelivery(message -> {})) return error(409, "当前没有可继续的暂停任务，请刷新状态后检查");
-        return ResponseEntity.ok(Map.of("success", true, "message", "正在重新检查登录与额度，暂停任务将使用原配置继续"));
+        StartOutcome outcome = coordinator.resume("zhilian", message -> {});
+        if (!outcome.accepted()) {
+            return error(409, outcome.message());
+        }
+        return ResponseEntity.ok(Map.of("success", true, "message", outcome.message()));
     }
 
     private ResponseEntity<?> error(int status, String message) {

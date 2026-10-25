@@ -14,6 +14,7 @@ import java.util.Map;
  */
 @Data
 public class BossConfig {
+    private com.getjobs.application.service.JobProfileService.Snapshot confirmedProfile;
     public static final String DEFAULT_REPEAT_CHAT_MESSAGES = String.join("\n",
             "请问是有什么顾虑需要沟通吗？",
             "我可以去贵公司面试吗？",

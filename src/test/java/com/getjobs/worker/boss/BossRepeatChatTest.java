@@ -18,6 +18,10 @@ class BossRepeatChatTest {
     void sendsOnlyWhenButtonAndSwitchAllow(String text, Boolean enabled, boolean expected, boolean emptyMessages) throws Exception {
         BossService service = mock(BossService.class);
         Boss boss = new Boss(service, null, null);
+        var journal = mock(com.getjobs.application.service.BossDeliveryLedger.class);
+        when(journal.reserve(any(), any(), any(), any(), any())).thenReturn("attempt");
+        boss.setLedger(journal);
+        boss.setTaskId("test-task");
         BossConfig config = new BossConfig();
         config.setAllowRepeatChat(enabled);
         config.setSayHi("您好，希望进一步沟通。");
@@ -26,6 +30,9 @@ class BossRepeatChatTest {
         boss.setConfig(config);
         Page listing = mock(Page.class);
         Page detail = mock(Page.class);
+        Frame frame = mock(Frame.class);
+        when(detail.frames()).thenReturn(java.util.List.of(frame));
+        when(frame.evaluate(anyString(), any())).thenReturn(0, 1);
         BrowserContext context = mock(BrowserContext.class);
         Locator more = mock(Locator.class);
         Locator button = mock(Locator.class);

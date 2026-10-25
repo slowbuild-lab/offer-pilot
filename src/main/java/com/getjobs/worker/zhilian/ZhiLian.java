@@ -47,6 +47,8 @@ public class ZhiLian {
     private int modernProcessedCount;
     @Setter private ZhilianDeliveryLedger ledger;
     @Setter private String taskId;
+    @Setter private java.util.function.Consumer<com.getjobs.application.service.JobCandidate> previewCallback;
+    @Setter private java.util.function.Consumer<com.getjobs.application.service.JobCandidate> externalGuard;
     public enum Outcome { COMPLETED, PAUSED, LIMIT_REACHED, PLATFORM_LIMIT, FAILED }
     @Getter private Outcome outcome = Outcome.COMPLETED;
     @Getter private String outcomeReason = "";
@@ -263,7 +265,7 @@ public class ZhiLian {
                 return deliverModernPage();
             }
 
-            if (ledger != null) {
+            if (ledger != null || previewCallback != null) {
                 end(Outcome.PAUSED, "当前是旧版岗位页面，安全投递未执行，请检查页面后继续");
                 return false;
             }
@@ -476,6 +478,12 @@ public class ZhiLian {
                 entity.setExperience(tags.stream().filter(tag -> tag.matches(".*(年|经验不限|无经验|应届|在校).*"))
                         .findFirst().orElse(""));
                 entity.setDeliveryStatus("未投递");
+                var candidate = new com.getjobs.application.service.JobCandidate("zhilian",jobId,title,company,entity.getLocation(),entity.getSalary(),link);
+                if (previewCallback != null) { previewCallback.accept(candidate); continue; }
+                if (config.getConfirmedProfile() != null && !config.getConfirmedProfile().rules().match(candidate).eligible()) {
+                    sendProgress("跳过不符合已确认方案的岗位：" + title, null, null); continue;
+                }
+                if (externalGuard != null) externalGuard.accept(candidate);
                 if (!zhilianService.existsByJobId(jobId)) {
                     zhilianService.insertJob(entity);
                 }
@@ -514,6 +522,11 @@ public class ZhiLian {
                     if (attemptId != null) ledger.cancelBeforeClick(attemptId);
                     return false;
                 }
+                try { if (externalGuard != null) externalGuard.accept(candidate); }
+                catch (RuntimeException denied) {
+                    if (attemptId != null) { ledger.cancelBeforeClick(attemptId); attemptId=null; }
+                    end(Outcome.PAUSED, denied.getMessage()); return false;
+                }
                 applyButton.click();
                 try {
                     page.waitForFunction("""
@@ -550,6 +563,10 @@ public class ZhiLian {
                     return false;
                 }
                 if (shouldStop() || !allowPage()) return false;
+            } catch (com.getjobs.application.service.DailyQuotaService.Exhausted e) {
+                attemptId = null;
+                end(Outcome.LIMIT_REACHED, e.getMessage());
+                return false;
             } catch (ZhilianDeliveryLedger.StorageException | org.springframework.dao.DataAccessException e) {
                 end(Outcome.FAILED, "投递记录不可用，任务已停止，请查看日志后再启动");
                 log.error("智联投递记录操作失败", e);

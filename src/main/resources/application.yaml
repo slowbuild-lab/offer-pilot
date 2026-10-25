@@ -12,11 +12,15 @@ spring:
     charset: UTF-8
     location: classpath:banner.txt
   datasource:
-    url: jdbc:sqlite:./db/getjobs.db
+    # 多平台并行后写入会同时发生：busy_timeout 让 SQLite 等待锁而不是立刻报 SQLITE_BUSY，
+    # WAL 让读不阻塞写（投递记录读写与前端状态查询会并发）。
+    url: jdbc:sqlite:./db/getjobs.db?busy_timeout=15000&journal_mode=WAL
     driver-class-name: org.sqlite.JDBC
     hikari:
       maximum-pool-size: 5
       connection-test-query: SELECT 1
+      # 每条连接都设置等待时间，避免某个连接绕过 URL 参数
+      connection-init-sql: PRAGMA busy_timeout=15000
   sql:
     init:
       mode: never  # 数据库文件已存在，不需要自动初始化

@@ -3,6 +3,7 @@ package com.getjobs.worker.service;
 import com.getjobs.application.service.ConfigService;
 import com.getjobs.application.service.ZhilianDeliveryLedger;
 import com.getjobs.worker.dto.JobProgressMessage;
+import com.getjobs.worker.manager.PlatformTaskGate;
 import com.getjobs.worker.manager.PlaywrightManager;
 import com.getjobs.worker.zhilian.ZhiLian;
 import com.getjobs.worker.zhilian.ZhilianConfig;
@@ -27,7 +28,10 @@ public class ZhilianJobService implements JobPlatformService {
     private final PlaywrightManager playwrightManager;
     private final ObjectProvider<ZhiLian> zhilianProvider;
     private final ConfigService configService;
+    private final PlatformTaskGate gate;
     @Autowired private ZhilianDeliveryLedger ledger;
+    @Autowired private com.getjobs.application.service.JobProfileService profiles;
+    @Autowired private com.getjobs.application.service.JobProfileRuntime profileRuntime;
     private volatile boolean isRunning;
     private volatile boolean shouldStop;
     private volatile String taskState = "IDLE";
@@ -48,8 +52,26 @@ public class ZhilianJobService implements JobPlatformService {
         if ("PAUSED".equals(taskState)) lastMessageType = "warning";
     }
 
+    /** @deprecated 请通过 {@link PlatformTaskCoordinator#start} 启动，以便统一判定并行上限 */
+    @Deprecated
     public boolean startDelivery(Consumer<JobProgressMessage> listener) { return dispatch(listener, false); }
+
+    /** @deprecated 请通过 {@link PlatformTaskCoordinator#resume} 继续，以便统一判定并行上限 */
+    @Deprecated
     public boolean resumeDelivery(Consumer<JobProgressMessage> listener) { return dispatch(listener, true); }
+
+    /** 同步执行"继续暂停任务"，由 PlatformTaskCoordinator 在后台线程调用 */
+    public boolean executeResume(Consumer<JobProgressMessage> listener) {
+        if (!reserveTask(true)) {
+            listener.accept(JobProgressMessage.warning(PLATFORM, lastMessage.isBlank()
+                    ? "没有可继续的暂停任务，请刷新状态后检查" : lastMessage));
+            return false;
+        }
+        executeReserved(listener, true);
+        return true;
+    }
+
+    @Deprecated
     private boolean dispatch(Consumer<JobProgressMessage> listener, boolean resume) {
         if (!reserveTask(resume)) return false;
         try {
@@ -105,15 +127,18 @@ public class ZhilianJobService implements JobPlatformService {
             deliveredCount = 0;
             progress.accept(JobProgressMessage.info(PLATFORM, "检查浏览器状态..."));
             if (shouldStop) return;
-            playwrightManager.ensureReady();
+            // 只启动智联自己的浏览器会话（独立进程），不影响 BOSS 正在进行的任务
+            playwrightManager.ensureReady(PLATFORM);
             if (shouldStop) return;
-            var page = playwrightManager.getZhilianPage();
-            if (page == null) { progress.accept(JobProgressMessage.error(PLATFORM, "智联招聘页面未初始化")); return; }
             if (!playwrightManager.isLoggedIn(PLATFORM)) {
-                progress.accept(JobProgressMessage.error(PLATFORM, "请先登录智联招聘")); return;
+                progress.accept(JobProgressMessage.error(PLATFORM, "请先登录智联招聘（可点击“打开浏览器登录”扫码）")); return;
             }
-            playwrightManager.pauseZhilianMonitoring();
+            playwrightManager.pauseMonitoring(PLATFORM);
             ZhilianConfig config = resume && ledger != null ? ledger.loadConfig(currentTaskId) : configService.getZhilianConfig();
+            if (!resume) {
+                var snapshot = profiles.activeFor(PLATFORM).orElse(null);
+                if (snapshot != null) profileRuntime.apply(config, snapshot);
+            }
             if (config == null || config.getKeywords() == null || config.getKeywords().stream()
                     .noneMatch(word -> word != null && !word.isBlank())) {
                 progress.accept(JobProgressMessage.error(PLATFORM, "请先填写搜索关键词并保存配置")); return;
@@ -131,10 +156,10 @@ public class ZhilianJobService implements JobPlatformService {
             progress.accept(JobProgressMessage.info(PLATFORM, "开始投递任务..."));
             AtomicReference<String> workerError = new AtomicReference<>();
             ZhiLian worker = zhilianProvider.getObject();
-            worker.setPage(page);
             worker.setConfig(config);
             worker.setLedger(ledger);
             worker.setTaskId(executingTaskId);
+            worker.setExternalGuard(job -> profileRuntime.guard(config.getConfirmedProfile(), job));
             worker.setShouldStopCallback(this::shouldStop);
             worker.setProgressCallback((message, current, total) -> {
                 // Older workers can still report diagnostics through this callback.
@@ -146,7 +171,12 @@ public class ZhilianJobService implements JobPlatformService {
                         : JobProgressMessage.info(PLATFORM, message));
             });
             worker.prepare();
-            deliveredCount = playwrightManager.callOnPlaywright(worker::execute);
+            // 整个智联投递流程跑在智联自己的会话线程上，Page 也在该线程内取用；
+            // 智联等待成功弹窗期间，BOSS 的执行线程和 Playwright 实例完全不受影响。
+            deliveredCount = playwrightManager.callOn(PLATFORM, page -> {
+                worker.setPage(page);
+                return worker.execute();
+            });
             if (shouldStop) return;
             if (worker.getOutcome() != null && worker.getOutcome() != ZhiLian.Outcome.COMPLETED) {
                 finalState = worker.getOutcome().name();
@@ -163,7 +193,7 @@ public class ZhilianJobService implements JobPlatformService {
             finalState = "FAILED";
             progress.accept(JobProgressMessage.error(PLATFORM, "投递失败: " + e.getMessage()));
         } finally {
-            try { playwrightManager.resumeZhilianMonitoring(); } catch (Exception ignored) {}
+            try { playwrightManager.resumeMonitoring(PLATFORM); } catch (Exception ignored) {}
             synchronized (this) {
                 if (shouldStop) {
                     finalState = "STOPPED";
@@ -184,7 +214,12 @@ public class ZhilianJobService implements JobPlatformService {
 
     @Override
     public synchronized void stopDelivery() {
-        if (isRunning) { shouldStop = true; taskState = "STOPPING"; }
+        if (isRunning) {
+            shouldStop = true;
+            taskState = "STOPPING";
+            lastMessage = "正在停止，等待当前岗位处理完并释放浏览器";
+            lastMessageType = "warning";
+        }
         else if (isPaused()) {
             if (ledger != null) ledger.finishTask(currentTaskId, "STOPPED", "用户结束暂停任务");
             taskState = "STOPPED";
@@ -207,6 +242,8 @@ public class ZhilianJobService implements JobPlatformService {
         status.put("lastMessage", lastMessage);
         status.put("lastMessageType", lastMessageType);
         status.put("deliveredCount", deliveredCount);
+        status.put("taskHeld", gate.holding(PLATFORM));
+        status.putAll(gate.parallelView(PLATFORM));
         if (ledger != null) status.putAll(ledger.summary(currentTaskId, dayLimit));
         return status;
     }

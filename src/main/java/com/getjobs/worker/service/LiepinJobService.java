@@ -46,15 +46,9 @@ public class LiepinJobService implements JobPlatformService {
         }
 
         try {
-            // 浏览器可能已被手动关闭 / 崩溃，先确保可用，必要时重新拉起
+            // 浏览器可能已被手动关闭 / 崩溃，先确保可用；只启动/恢复猎聘自己的会话
             progressCallback.accept(JobProgressMessage.info(PLATFORM, "检查浏览器状态..."));
-            playwrightManager.ensureReady();
-
-            Page page = playwrightManager.getLiepinPage();
-            if (page == null) {
-                progressCallback.accept(JobProgressMessage.error(PLATFORM, "猎聘页面未初始化"));
-                return;
-            }
+            playwrightManager.ensureReady(PLATFORM);
 
             if (!playwrightManager.isLoggedIn(PLATFORM)) {
                 progressCallback.accept(JobProgressMessage.error(PLATFORM, "请先登录猎聘"));
@@ -65,7 +59,7 @@ public class LiepinJobService implements JobPlatformService {
             shouldStop = false;
 
             // 暂停后台登录监控，避免并发访问冲突
-            playwrightManager.pauseLiepinMonitoring();
+            playwrightManager.pauseMonitoring(PLATFORM);
 
             // 加载配置（统一通过 ConfigService 从专表读取）
             LiepinConfig config = configService.getLiepinConfig();
@@ -83,13 +77,15 @@ public class LiepinJobService implements JobPlatformService {
             };
 
             Liepin liepin = liepinProvider.getObject();
-            liepin.setPage(page);
             liepin.setConfig(config);
             liepin.setProgressCallback(cb);
             liepin.setShouldStopCallback(this::shouldStop);
 
-            // 必须跑在 Playwright 专用线程上，否则会和后台登录监控并发操作同一条连接
-            int deliveredCount = playwrightManager.callOnPlaywright(liepin::execute);
+            // 必须跑在猎聘自己的会话线程上，和 BOSS/智联 的浏览器互不影响
+            int deliveredCount = playwrightManager.callOn(PLATFORM, page -> {
+                liepin.setPage(page);
+                return liepin.execute();
+            });
 
             progressCallback.accept(JobProgressMessage.success(PLATFORM,
                 String.format("投递任务完成，共发起%d个聊天", deliveredCount)));
@@ -100,7 +96,7 @@ public class LiepinJobService implements JobPlatformService {
             isRunning = false;
             shouldStop = false;
             try {
-                playwrightManager.resumeLiepinMonitoring();
+                playwrightManager.resumeMonitoring(PLATFORM);
             } catch (Exception ignored) {}
         }
     }

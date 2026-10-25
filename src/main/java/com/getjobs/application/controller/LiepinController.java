@@ -7,6 +7,8 @@ import com.getjobs.application.service.CookieService;
 import com.getjobs.application.service.LiepinService;
 import com.getjobs.worker.manager.PlaywrightManager;
 import com.getjobs.worker.service.LiepinJobService;
+import com.getjobs.worker.service.PlatformTaskCoordinator;
+import com.getjobs.worker.service.StartOutcome;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -39,6 +41,9 @@ public class LiepinController {
 
     @Autowired
     private LiepinService liepinService;
+
+    @Autowired
+    private PlatformTaskCoordinator coordinator;
 
     /**
      * 检查登录状态
@@ -88,16 +93,14 @@ public class LiepinController {
                 return ResponseEntity.badRequest().body(response);
             }
 
-            // 异步启动新任务
-            CompletableFuture.runAsync(() -> {
-                liepinJobService.executeDelivery(progressMessage -> {
-                    log.info("[{}] {}", progressMessage.getPlatform(), progressMessage.getMessage());
-                });
-            });
-
-            response.put("success", true);
-            response.put("message", "猎聘任务启动成功");
-            response.put("status", "started");
+            StartOutcome outcome = coordinator.start("liepin", progressMessage ->
+                    log.info("[{}] {}", progressMessage.getPlatform(), progressMessage.getMessage()));
+            response.put("success", outcome.accepted());
+            response.put("message", outcome.message());
+            response.put("status", outcome.status());
+            if (!outcome.accepted()) {
+                return ResponseEntity.status(409).body(response);
+            }
 
             log.info("通过API启动猎聘任务成功");
             return ResponseEntity.ok(response);
@@ -126,10 +129,13 @@ public class LiepinController {
                 return ResponseEntity.badRequest().body(response);
             }
 
-            liepinJobService.stopDelivery();
-
-            response.put("success", true);
-            response.put("message", "猎聘任务停止请求已发送");
+            StartOutcome outcome = coordinator.stop("liepin");
+            response.put("success", outcome.accepted());
+            response.put("status", outcome.status());
+            response.put("message", outcome.message());
+            if (!outcome.accepted()) {
+                return ResponseEntity.badRequest().body(response);
+            }
 
             log.info("通过API停止猎聘任务");
             return ResponseEntity.ok(response);

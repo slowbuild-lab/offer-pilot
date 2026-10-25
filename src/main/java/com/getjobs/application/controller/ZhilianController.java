@@ -5,6 +5,8 @@ import com.getjobs.application.entity.ZhilianConfigEntity;
 import com.getjobs.application.service.CookieService;
 import com.getjobs.application.service.ZhilianService;
 import com.getjobs.worker.manager.PlaywrightManager;
+import com.getjobs.worker.service.PlatformTaskCoordinator;
+import com.getjobs.worker.service.StartOutcome;
 import com.getjobs.worker.service.ZhilianJobService;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -14,6 +16,7 @@ import org.springframework.web.bind.annotation.*;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CompletableFuture;
 import java.util.stream.Collectors;
 
 /**
@@ -37,6 +40,12 @@ public class ZhilianController {
 
     @Autowired
     private ZhilianJobService zhilianJobService;
+
+    @Autowired
+    private PlatformTaskCoordinator coordinator;
+
+    @Autowired
+    private com.getjobs.application.service.DailyQuotaService dailyQuota;
 
     // ==================== 配置管理相关接口 ====================
 
@@ -77,7 +86,10 @@ public class ZhilianController {
      */
     @PutMapping("/config")
     public ZhilianConfigEntity updateConfig(@RequestBody ZhilianConfigEntity config) {
-        return zhilianService.updateConfig(config);
+        dailyQuota.get("zhilian"); // Seed from the existing value before the legacy form changes it.
+        ZhilianConfigEntity saved = zhilianService.updateConfig(config);
+        if (config.getMaxAttemptsPerDay() != null) dailyQuota.update("zhilian", config.getMaxAttemptsPerDay());
+        return saved;
     }
 
     /**
@@ -119,15 +131,23 @@ public class ZhilianController {
     }
 
     /**
-     * 触发智联招聘登录：在未登录时点击二维码入口，等待扫码
+     * 触发智联招聘登录：在未登录时点击二维码入口，等待扫码。
+     * 只负责打开智联自己的浏览器窗口，立即返回，不阻塞请求线程。
      */
     @PostMapping("/login")
     public ResponseEntity<Map<String, Object>> triggerZhilianLogin() {
         Map<String, Object> response = new HashMap<>();
         try {
-            playwrightManager.triggerZhilianLogin();
+            CompletableFuture.runAsync(() -> {
+                try {
+                    playwrightManager.triggerZhilianLogin();
+                } catch (Exception e) {
+                    log.error("打开智联登录页失败", e);
+                }
+            });
             response.put("success", true);
-            response.put("message", "已尝试打开智联二维码登录入口，请在浏览器扫码登录");
+            response.put("status", "opening");
+            response.put("message", "正在打开智联独立浏览器窗口（首次启动约需 10-30 秒），请在窗口内扫码登录");
             return ResponseEntity.ok(response);
         } catch (Exception e) {
             log.error("触发智联登录失败", e);
@@ -278,32 +298,25 @@ public class ZhilianController {
             // 未登录则不允许启动
             if (!playwrightManager.isLoggedIn("zhilian")) {
                 response.put("success", false);
-                response.put("message", "请先登录智联招聘");
+                response.put("message", "请先登录智联招聘（点击“打开浏览器登录”扫码）");
                 response.put("status", "not_logged_in");
                 return ResponseEntity.badRequest().body(response);
             }
-
-            // 检查是否已有任务在运行
-            if (zhilianJobService.isRunning()) {
+            if (zhilianJobService.isPaused()) {
                 response.put("success", false);
-                response.put("message", "智联招聘任务已在运行中，请等待当前任务完成");
-                response.put("status", "running");
-                return ResponseEntity.badRequest().body(response);
-            }
-
-            // 异步启动新任务
-            boolean accepted = zhilianJobService.startDelivery(progressMessage ->
-                    log.info("[{}] {}", progressMessage.getPlatform(), progressMessage.getMessage()));
-            if (!accepted) {
-                response.put("success", false);
-                response.put("message", "任务已在启动或运行中");
-                response.put("status", "running");
+                response.put("message", "存在已暂停的任务，请先在投递控制面板继续或结束该任务");
+                response.put("status", "paused");
                 return ResponseEntity.status(409).body(response);
             }
 
-            response.put("success", true);
-            response.put("message", "智联招聘任务启动成功");
-            response.put("status", "started");
+            StartOutcome outcome = coordinator.start("zhilian", progressMessage ->
+                    log.info("[{}] {}", progressMessage.getPlatform(), progressMessage.getMessage()));
+            response.put("success", outcome.accepted());
+            response.put("message", outcome.message());
+            response.put("status", outcome.status());
+            if (!outcome.accepted()) {
+                return ResponseEntity.status(409).body(response);
+            }
 
             log.info("通过API启动智联招聘任务成功");
             return ResponseEntity.ok(response);
@@ -332,12 +345,21 @@ public class ZhilianController {
                 return ResponseEntity.badRequest().body(response);
             }
 
+            if (zhilianJobService.isRunning()) {
+                StartOutcome outcome = coordinator.stop("zhilian");
+                response.put("success", outcome.accepted());
+                response.put("message", outcome.message());
+                response.put("status", outcome.status());
+                log.info("通过API停止智联招聘任务");
+                return ResponseEntity.ok(response);
+            }
+
+            // 暂停中的任务：结束它，不涉及运行中的浏览器操作
             zhilianJobService.stopDelivery();
-
             response.put("success", true);
-            response.put("message", "智联招聘任务停止请求已发送");
-
-            log.info("通过API停止智联招聘任务");
+            response.put("message", "已结束暂停任务");
+            response.put("status", "stopped");
+            log.info("通过API结束智联暂停任务");
             return ResponseEntity.ok(response);
 
         } catch (Exception e) {
@@ -346,6 +368,17 @@ public class ZhilianController {
             response.put("message", "停止智联招聘任务失败: " + e.getMessage());
             return ResponseEntity.internalServerError().body(response);
         }
+    }
+
+    /** POST - 强制结束：只关闭智联自己的浏览器，BOSS 等其它平台不受影响 */
+    @PostMapping("/force-stop")
+    public ResponseEntity<Map<String, Object>> forceStopZhilianJob() {
+        StartOutcome outcome = coordinator.forceStop("zhilian");
+        return ResponseEntity.ok(Map.of(
+                "success", outcome.accepted(),
+                "status", outcome.status(),
+                "message", outcome.message()
+        ));
     }
 
     /**
