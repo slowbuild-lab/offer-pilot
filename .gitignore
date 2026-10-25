@@ -75,7 +75,10 @@ dist/
 # Gradle cache
 .gradle/
 # 持久化浏览器用户数据（含登录态，绝对不能提交）
+# 多平台并行后每个平台一个独立目录：browser-data/boss、browser-data/zhilian、
+# browser-data/liepin、browser-data/51job。旧的 browser-data/Default 资料保留在原处。
 browser-data/
+browser-data/*/
 
 # VitePress Documentation
 docs/node_modules/
