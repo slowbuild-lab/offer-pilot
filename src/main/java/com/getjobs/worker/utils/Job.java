@@ -46,6 +46,11 @@ public class Job implements Serializable {
     private String recruiter;
 
     /**
+     * HR 稳定标识（平台下发的脱敏 id），用于接触冷却判定
+     */
+    private String hrId;
+
+    /**
      * 公司名字
      */
     private String companyName;

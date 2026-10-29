@@ -14,9 +14,15 @@ import static com.getjobs.application.service.SqliteJournal.*;
 public class JobProfileService {
     public record Snapshot(long version, JobProfile rules, Long confirmedAt, String materialToken) {}
     private final DataSource source; private final Clock clock;
+    private final ContactGuard contacts;
     private final ObjectMapper json=new ObjectMapper();
-    @Autowired public JobProfileService(DataSource source) { this(source,Clock.systemUTC()); }
-    public JobProfileService(DataSource source,Clock clock) { this.source=source; this.clock=clock; }
+    @Autowired public JobProfileService(DataSource source,ContactGuard contacts) { this(source,Clock.systemUTC(),contacts); }
+    public JobProfileService(DataSource source) { this(source,Clock.systemUTC()); }
+    public JobProfileService(DataSource source,Clock clock) { this(source,clock,initializedGuard(source,clock)); }
+    public JobProfileService(DataSource source,Clock clock,ContactGuard contacts) { this.source=source; this.clock=clock; this.contacts=contacts; }
+    private static ContactGuard initializedGuard(DataSource source,Clock clock) {
+        var guard=new ContactGuard(source,clock); guard.initialize(); return guard;
+    }
     @PostConstruct public void initialize() {
         transaction(source,c -> {
             execute(c,"CREATE TABLE IF NOT EXISTS job_profiles (version INTEGER PRIMARY KEY AUTOINCREMENT,rules_json TEXT NOT NULL,confirmed_at INTEGER,preview_at INTEGER,preview_json TEXT,material_token TEXT NOT NULL DEFAULT '')");
@@ -61,8 +67,10 @@ public class JobProfileService {
             var output=new ArrayList<Map<String,Object>>();
             for (var job:candidates) {
                 var match=profile.rules().match(job);
-                if (isForbidden(c,job)) match=new JobProfile.Match(false,"命中紧急禁止或信息不足以核验禁止项");
-                output.add(Map.of("job",job,"eligible",match.eligible(),"reason",match.reason()));
+                if (isForbidden(c,job)) match=match.reject("FORBIDDEN","紧急禁止","命中紧急禁止或信息不足以核验禁止项",Objects.toString(job.company(),""));
+                var cooldown=contacts.evaluate(c,profile.rules().contactPolicy(),job);
+                if (cooldown.isPresent()) match=match.with(cooldown.get());
+                output.add(Map.of("job",job,"eligible",match.eligible(),"reason",match.reason(),"checks",match.checks()));
             }
             execute(c,"UPDATE job_profiles SET preview_at=?,preview_json=?,material_token=? WHERE version=?",clock.millis(),json.writeValueAsString(output),materialToken,version);
             return output;
@@ -103,6 +111,8 @@ public class JobProfileService {
         if (!result.eligible()) throw new IllegalStateException(result.reason());
         transaction(source,c -> {
             if (isForbidden(c,job)) throw new IllegalStateException("已加入紧急禁止，停止外发");
+            var cooldown=contacts.evaluate(c,snapshot.rules().contactPolicy(),job);
+            if (cooldown.isPresent() && !cooldown.get().passed()) throw new IllegalStateException(cooldown.get().reason());
             return null;
         });
     }

@@ -24,6 +24,7 @@ import java.util.function.Consumer;
 @Slf4j
 @Service
 public class PlatformTaskCoordinator {
+    @org.springframework.beans.factory.annotation.Autowired private com.getjobs.application.service.DeliveryPacingService pacing;
 
     private final PlatformTaskGate gate;
     private final PlaywrightManager playwrightManager;
@@ -167,9 +168,14 @@ public class PlatformTaskCoordinator {
     /** 各平台自己的任务状态（不包含浏览器细节） */
     public Map<String, Map<String, Object>> statuses() {
         Map<String, Map<String, Object>> result = new LinkedHashMap<>();
+        var protection=pacing==null?Map.of():pacing.snapshot();
         services.forEach((platform, service) -> {
             try {
-                result.put(platform, service.getStatus());
+                var status=new LinkedHashMap<String,Object>(service.getStatus());
+                if(protection.get("platforms") instanceof Map<?,?> all&&all.get(platform) instanceof Map<?,?> config){
+                    status.put("pacing",config.get("state"));status.put("pacingLimit",config.get("effectiveLimit"));status.put("pacingUsed",config.get("used"));
+                }
+                result.put(platform,status);
             } catch (Exception e) {
                 result.put(platform, Map.of("platform", platform, "error", String.valueOf(e.getMessage())));
             }

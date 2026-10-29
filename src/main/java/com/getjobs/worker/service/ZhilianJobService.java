@@ -32,6 +32,7 @@ public class ZhilianJobService implements JobPlatformService {
     @Autowired private ZhilianDeliveryLedger ledger;
     @Autowired private com.getjobs.application.service.JobProfileService profiles;
     @Autowired private com.getjobs.application.service.JobProfileRuntime profileRuntime;
+    @Autowired private com.getjobs.application.service.DeliveryPacingService pacing;
     private volatile boolean isRunning;
     private volatile boolean shouldStop;
     private volatile String taskState = "IDLE";
@@ -175,7 +176,9 @@ public class ZhilianJobService implements JobPlatformService {
             // 智联等待成功弹窗期间，BOSS 的执行线程和 Playwright 实例完全不受影响。
             deliveredCount = playwrightManager.callOn(PLATFORM, page -> {
                 worker.setPage(page);
-                return worker.execute();
+                try(var session=new com.getjobs.worker.utils.DeliveryPacingSession(pacing,PLATFORM,this::shouldStop,m->progress.accept(JobProgressMessage.info(PLATFORM,m)))){
+                    session.attach(page);worker.setPacing(session);int result=worker.execute();if(!shouldStop)session.check();return result;
+                }
             });
             if (shouldStop) return;
             if (worker.getOutcome() != null && worker.getOutcome() != ZhiLian.Outcome.COMPLETED) {
@@ -190,7 +193,7 @@ public class ZhilianJobService implements JobPlatformService {
             }
         } catch (Exception e) {
             log.error("智联招聘任务执行失败", e);
-            finalState = "FAILED";
+            finalState = e instanceof com.getjobs.worker.utils.DeliveryPacingSession.Halt?"PAUSED":"FAILED";
             progress.accept(JobProgressMessage.error(PLATFORM, "投递失败: " + e.getMessage()));
         } finally {
             try { playwrightManager.resumeMonitoring(PLATFORM); } catch (Exception ignored) {}

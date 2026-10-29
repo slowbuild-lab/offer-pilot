@@ -8,6 +8,7 @@ import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import PageHeader from '@/app/components/PageHeader'
 import { API_BASE } from '@/lib/api'
+import DeliveryPacingSettings from '@/app/components/DeliveryPacingSettings'
 
 export default function EnvConfig() {
   const [envConfig, setEnvConfig] = useState({
@@ -137,6 +138,7 @@ export default function EnvConfig() {
       )}
 
       <div className="space-y-6">
+        <DeliveryPacingSettings />
         {/* 企业微信 Webhook */}
         <Card className="animate-in fade-in slide-in-from-bottom-5 duration-700">
           <CardHeader className="flex items-start gap-4">

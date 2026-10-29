@@ -30,7 +30,7 @@ public class JobProfileController {
     @PostMapping("/versions") public Map<String,Object> save(@RequestBody JsonNode body,@RequestHeader(value="Origin",required=false) String origin) throws Exception {
         DeliveryRecordsController.localMutation(origin);
         if (!body.isObject()) throw new IllegalArgumentException("方案必须为对象");
-        var allowed=Set.of("name","platforms","keywords","city","minimumMonthlySalary","salaryHard","excludeCompanies","excludeJobs","bossMessage","bossImage","zhilianResumeConfirmed");
+        var allowed=Set.of("name","platforms","keywords","city","minimumMonthlySalary","salaryHard","excludeCompanies","excludeJobs","bossMessage","bossImage","zhilianResumeConfirmed","bossFilters","contactPolicy");
         var fields=body.fieldNames(); while(fields.hasNext()) if (!allowed.contains(fields.next())) throw new IllegalArgumentException("包含未支持的方案字段");
         for(String field:List.of("salaryHard","bossImage","zhilianResumeConfirmed")) if (body.has(field) && !body.get(field).isBoolean()) throw new IllegalArgumentException(field+" 必须为布尔值");
         if (body.hasNonNull("minimumMonthlySalary") && (!body.get("minimumMonthlySalary").isIntegralNumber() || !body.get("minimumMonthlySalary").canConvertToInt())) throw new IllegalArgumentException("最低月薪必须为整数");
@@ -38,6 +38,26 @@ public class JobProfileController {
         for(String field:List.of("platforms","keywords","excludeCompanies","excludeJobs")) if (body.has(field)) {
             if (!body.get(field).isArray()) throw new IllegalArgumentException(field+" 必须为列表");
             for (JsonNode item:body.get(field)) if (!item.isTextual()) throw new IllegalArgumentException(field+" 必须为文本列表");
+        }
+        if (body.has("bossFilters")) {
+            var filters=body.get("bossFilters");
+            if (!filters.isObject()) throw new IllegalArgumentException("BOSS高级条件必须为对象");
+            var supported=Set.of("includeCompanies","descriptionInclude","descriptionExclude");
+            var names=filters.fieldNames();
+            while(names.hasNext()) {
+                String field=names.next();
+                if (!supported.contains(field)) throw new IllegalArgumentException("包含未支持的BOSS高级条件");
+                if (!filters.get(field).isArray()) throw new IllegalArgumentException("BOSS高级条件必须为文本列表");
+                for(JsonNode item:filters.get(field)) if (!item.isTextual()) throw new IllegalArgumentException("BOSS高级条件必须为文本列表");
+            }
+        }
+        if (body.has("contactPolicy")) {
+            var policy=body.get("contactPolicy");
+            if (!policy.isObject()) throw new IllegalArgumentException("BOSS HR 冷却期必须为对象");
+            var names=policy.fieldNames();
+            while(names.hasNext()) if (!"hrCooldownDays".equals(names.next())) throw new IllegalArgumentException("包含未支持的冷却期字段");
+            if (policy.hasNonNull("hrCooldownDays") && (!policy.get("hrCooldownDays").isIntegralNumber() || !policy.get("hrCooldownDays").canConvertToInt()))
+                throw new IllegalArgumentException("HR 冷却期天数必须为整数");
         }
         try { return Map.of("version",profiles.save(json.treeToValue(body,JobProfile.class))); }
         catch (com.fasterxml.jackson.core.JsonProcessingException e) { throw new IllegalArgumentException("方案字段不合法，请检查名称、城市和关键词"); }

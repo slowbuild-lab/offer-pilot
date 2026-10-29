@@ -10,6 +10,15 @@ import static org.junit.jupiter.api.Assertions.*;
 class JobProfileServiceTest {
     @TempDir Path directory;
     private JobProfile profile() { return new JobProfile("Java求职",List.of("boss"),List.of("Java"),"北京",15000,true,List.of("外包"),List.of("销售"),"您好",false,false); }
+    @Test void previewPersistsChecksIncludingPlatformExclusionsAndUrgentForbids() throws Exception {
+        var source=new SQLiteDataSource(); source.setUrl("jdbc:sqlite:"+directory.resolve("evidence.db"));
+        var service=new JobProfileService(source); service.initialize(); long version=service.save(profile());
+        service.forbid("company","公司");
+        var result=service.recordPreview(version,List.of(new JobCandidate("boss","one","Java开发","公司","北京","15-20K","")));
+        assertEquals(false,result.getFirst().get("eligible"));
+        assertTrue(result.getFirst().containsKey("checks"));
+        assertTrue(service.preview(version).getFirst().get("checks").toString().contains("FORBIDDEN"));
+    }
     @Test void missingHardInformationSalaryOverlapAndExclusionsNeverPass() {
         var rules=profile();
         assertTrue(rules.match(new JobCandidate("boss","1","JAVA开发","公司","北京市","15-20K·13薪","")).eligible());

@@ -10,12 +10,15 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
 class DeliveryRecordsControllerTest {
     @Test void rejectsNonIntegerLimitsUnsupportedPlatformsAndForeignMutationOrigin() throws Exception {
         var boss=mock(BossDeliveryLedger.class); var z=mock(ZhilianDeliveryLedger.class); var quota=mock(DailyQuotaService.class);
-        var mvc=MockMvcBuilders.standaloneSetup(new DeliveryRecordsController(boss,z,quota)).build();
+        var mvc=MockMvcBuilders.standaloneSetup(new DeliveryRecordsController(boss,z,quota,new DeliveryReadService(mock(javax.sql.DataSource.class)))).build();
         mvc.perform(put("/api/delivery/limits/boss").contentType("application/json").content("{\"limit\":1.5}")).andExpect(status().isBadRequest());
         mvc.perform(put("/api/delivery/limits/boss").header("Origin","https://foreign.invalid").contentType("application/json").content("{\"limit\":20}")).andExpect(status().isForbidden());
         mvc.perform(get("/api/delivery/records").param("platform","unsupported")).andExpect(status().isBadRequest());
         mvc.perform(get("/api/delivery/records").param("page","0")).andExpect(status().isBadRequest());
         mvc.perform(get("/api/delivery/summary").header("Origin","https://foreign.invalid")).andExpect(status().isForbidden());
+        mvc.perform(get("/api/delivery/records").param("from","2026-02-30")).andExpect(status().isBadRequest());
+        mvc.perform(get("/api/delivery/records").param("state","invented")).andExpect(status().isBadRequest());
+        mvc.perform(get("/api/delivery/records").param("from","2026-10-27").param("to","2026-10-26")).andExpect(status().isBadRequest());
         verifyNoInteractions(quota);
     }
 }

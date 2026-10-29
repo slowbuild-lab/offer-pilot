@@ -39,7 +39,7 @@ export function platformName(platform: string): string {
 /** 只读预检；失败返回 null，由调用方决定是否继续（不阻塞原有启动流程） */
 export async function runPreflight(platform: string): Promise<PreflightResult | null> {
   try {
-    const response = await fetch(`${API_BASE}/api/platforms/${platform}/preflight`, { method: 'POST' })
+    const response = await fetch(`${API_BASE}/api/platforms/${platform}/preflight`, { method: 'POST', signal: AbortSignal.timeout(8000) })
     if (!response.ok) return null
     return (await response.json()) as PreflightResult
   } catch {

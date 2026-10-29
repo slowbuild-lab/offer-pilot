@@ -63,10 +63,69 @@ class BossBrowserSafetyTest {
     @Test void bossPreviewNeverOpensDetailOrUsesJournal() throws Exception {
         var worker=new Boss(null,null,null); var config=new BossConfig(); config.setDebugger(true); worker.setConfig(config);
         var collected=new ArrayList<JobCandidate>(); worker.setPreviewCallback(collected::add); worker.setShouldStopCallback(()->false);
-        Job job=new Job(); job.setHref("https://www.zhipin.com/job_detail/one.html"); job.setJobName("Java");
+        Job job=new Job(); job.setHref("https://www.zhipin.com/job_detail/one.html"); job.setJobName("Java"); job.setJobInfo("负责大模型开发");
         var method=Boss.class.getDeclaredMethod("resumeSubmission",String.class,Job.class); method.setAccessible(true);
         assertEquals(false,method.invoke(worker,"Java",job));
         assertEquals(1,collected.size()); // No Page or journal is supplied: any attempt to open/click would fail this test.
+        assertEquals("负责大模型开发",collected.getFirst().description());
+    }
+    @ParameterizedTest @ValueSource(booleans={false,true})
+    void evaluatesRealJobDescriptionBeforeOpeningChatAndKeepsQuotaForMatchesOnly(boolean allowed) throws Exception {
+        var source=new SQLiteDataSource(); source.setUrl("jdbc:sqlite:"+directory.resolve("advanced.db"));
+        var quotas=new DailyQuotaService(source); quotas.initialize(); var ledger=new BossDeliveryLedger(source,quotas); ledger.initialize();
+        var profiles=new JobProfileService(source); profiles.initialize();
+        var profile=new JobProfile("开发",List.of("boss"),List.of("Java"),"北京",null,true,List.of(),List.of(),"您好",false,false,
+                new JobProfile.BossFilters(List.of("隔离"),List.of("大模型"),List.of("销售")));
+        long version=profiles.save(profile); var snapshot=profiles.get(version);
+        var config=new BossConfig(); config.setConfirmedProfile(snapshot); config.setSayHi("您好");
+        var worker=new Boss(mock(BossService.class),null,null); worker.setConfig(config); worker.setLedger(ledger);
+        String task=ledger.createTask(20); ledger.bindConfig(task,config); worker.setTaskId(task); worker.setShouldStopCallback(()->false);
+        var screenings=new CandidateScreeningService(source); screenings.initialize();
+        worker.setScreeningCallback((job,result)->screenings.record(task,version,job,result));
+        worker.setExternalGuard(job->profiles.assertAllowed(snapshot,job));
+        var clicks=new AtomicInteger();
+        try(var context=browser.newContext();var sleeps=mockStatic(PlaywrightUtil.class)) {
+            context.exposeBinding("recordAction",(s,a)->{clicks.incrementAndGet();return null;});
+            context.route("**/*",route->route.fulfill(new Route.FulfillOptions().setContentType("text/html; charset=utf-8").setBody(DETAIL)));
+            var page=context.newPage(); page.setContent("<a class='more-job-btn' href='/job_detail/one.html'>详情</a>"); worker.setPage(page);
+            var job=new Job(); job.setHref("https://www.zhipin.com/job_detail/one.html"); job.setJobName("Java开发"); job.setCompanyName("隔离公司"); job.setJobArea("北京");
+            job.setJobInfo(allowed?"负责大模型开发，无需销售":"负责大模型开发，承担销售指标");
+            var method=Boss.class.getDeclaredMethod("resumeSubmission",String.class,Job.class); method.setAccessible(true);
+            var opened=new AtomicInteger(); context.onPage(p->opened.incrementAndGet());
+            assertEquals(allowed,method.invoke(worker,"Java",job));
+            assertEquals(allowed?2:0,clicks.get()); assertEquals(allowed?1:0,ledger.summary().get("todayAttempts"));
+            assertEquals(allowed?1:0,opened.get());
+            assertEquals(1,screenings.records(1,null,null,allowed?"passed":"excluded").get("total"));
+        }
+    }
+    @Test void recruiterCooldownSkipsTheSecondJobBeforeAnyExternalAction() throws Exception {
+        var source=new SQLiteDataSource(); source.setUrl("jdbc:sqlite:"+directory.resolve("cooldown.db"));
+        var quotas=new DailyQuotaService(source); quotas.initialize(); var ledger=new BossDeliveryLedger(source,quotas); ledger.initialize();
+        var contacts=new ContactGuard(source); contacts.initialize();
+        var profiles=new JobProfileService(source); profiles.initialize();
+        var profile=new JobProfile("开发",List.of("boss"),List.of("Java"),"北京",null,true,List.of(),List.of(),"您好",false,false,null,new JobProfile.ContactPolicy(30));
+        long version=profiles.save(profile); var snapshot=profiles.get(version);
+        var config=new BossConfig(); config.setConfirmedProfile(snapshot); config.setSayHi("您好");
+        var worker=new Boss(mock(BossService.class),null,null); worker.setConfig(config); worker.setLedger(ledger);
+        String task=ledger.createTask(20); ledger.bindConfig(task,config); worker.setTaskId(task); worker.setShouldStopCallback(()->false);
+        var screenings=new CandidateScreeningService(source); screenings.initialize();
+        worker.setScreeningCallback((job,result)->screenings.record(task,version,job,result));
+        worker.setCooldownCheck(job->contacts.evaluate(snapshot.rules().contactPolicy(),job));
+        worker.setExternalGuard(job->profiles.assertAllowed(snapshot,job));
+        contacts.record(new JobCandidate("boss","older-job","Java开发","隔离公司","北京","15-20K","https://www.zhipin.com/job_detail/older.html","负责大模型开发",null).withHr("hr-1",null));
+        var clicks=new AtomicInteger();
+        try(var context=browser.newContext();var sleeps=mockStatic(PlaywrightUtil.class)) {
+            context.exposeBinding("recordAction",(s,a)->{clicks.incrementAndGet();return null;});
+            context.route("**/*",route->route.fulfill(new Route.FulfillOptions().setContentType("text/html; charset=utf-8").setBody(DETAIL)));
+            var page=context.newPage(); page.setContent("<a class='more-job-btn' href='/job_detail/one.html'>详情</a>"); worker.setPage(page);
+            var job=new Job(); job.setHref("https://www.zhipin.com/job_detail/one.html"); job.setJobName("Java开发"); job.setCompanyName("隔离公司"); job.setJobArea("北京");
+            job.setJobInfo("负责大模型开发"); job.setHrId("hr-1");
+            var method=Boss.class.getDeclaredMethod("resumeSubmission",String.class,Job.class); method.setAccessible(true);
+            assertEquals(false,method.invoke(worker,"Java",job),()->"同一 HR 换岗位应被跳过:"+ledger.attempts(1));
+            assertEquals(0,clicks.get(),()->"冷却期命中后不应有任何外发动作:"+ledger.attempts(1));
+            assertEquals(0,ledger.summary().get("todayAttempts"));
+            assertEquals(1,screenings.records(1,null,null,"excluded").get("total"));
+        }
     }
     @Test void zhilianPreviewParsesRealDomWithoutApplyingOrWritingJobs() throws Exception {
         var service=mock(ZhilianService.class); var worker=new ZhiLian(service); var config=new ZhilianConfig(); worker.setConfig(config);
@@ -88,5 +147,47 @@ class BossBrowserSafetyTest {
             assertEquals(true,method.invoke(worker));
             assertEquals(1,collected.size()); assertEquals(0,clicks.get()); verifyNoInteractions(service);
         }
+    }
+    @ParameterizedTest @ValueSource(booleans={false,true})
+    void bossCollectOnlyParsesDetailJsonAndKeepsOriginalPlatformFilterEvidence(boolean legacyBlocked) throws Exception {
+        var service=mock(BossService.class);
+        when(service.getBlackJobs()).thenReturn(legacyBlocked?Set.of("Java"):Set.of());
+        when(service.getBlackCompanies()).thenReturn(Set.of()); when(service.getBlackRecruiters()).thenReturn(Set.of());
+        var worker=new Boss(service,null,null); var config=new BossConfig(); config.setDebugger(true);
+        config.setCityCode(List.of("101010100")); config.setKeywords(List.of("Java")); worker.setConfig(config);
+        var collected=new ArrayList<JobCandidate>(); worker.setPreviewCallback(collected::add); worker.setShouldStopCallback(()->false); worker.setProgressCallback((m,c,t)->{});
+        var requests=new ArrayList<String>();
+        try(var context=browser.newContext();var sleeps=mockStatic(PlaywrightUtil.class)) {
+            context.route("**/*",route->{
+                requests.add(route.request().url());
+                boolean detail=route.request().url().contains("/wapi/zpgeek/job/detail.json");
+                route.fulfill(new Route.FulfillOptions().setContentType(detail?"application/json":"text/html; charset=utf-8").setBody(detail?"""
+                    {"zpData":{"jobInfo":{"encryptId":"fixture-id","jobName":"Java开发","salaryDesc":"15-20K","locationName":"北京","postDescription":"负责大模型开发，无需销售"},"brandComInfo":{"brandName":"隔离公司"},"bossInfo":{"title":"招聘经理","activeTimeDesc":"今日活跃"}}}
+                    """:"""
+                    <ul class="rec-job-list"><li class="job-card-box" onclick="fetch('/wapi/zpgeek/job/detail.json')">Java开发</li></ul><a class="more-job-btn" href="/job_detail/fixture-id.html">详情</a><div id="footer">底部</div>
+                    """));
+            });
+            worker.setPage(context.newPage()); worker.prepare(); assertEquals(0,worker.execute());
+            assertEquals(1,collected.size()); var candidate=collected.getFirst();
+            assertEquals("fixture-id",candidate.jobId()); assertEquals("负责大模型开发，无需销售",candidate.description());
+            assertEquals(legacyBlocked,candidate.platformFilterReason().contains("黑名单"));
+            var profile=new JobProfile("开发",List.of("boss"),List.of("Java"),"北京",null,true,List.of(),List.of(),"您好",false,false,
+                    new JobProfile.BossFilters(List.of("隔离"),List.of("大模型"),List.of("销售")));
+            assertEquals(!legacyBlocked,profile.match(candidate).eligible());
+            assertTrue(requests.stream().allMatch(u->u.contains("/web/geek/jobs") || u.contains("/wapi/zpgeek/job/detail.json")));
+            verify(service,never()).insertBossJob(any());
+        }
+    }
+    @Test void unavailableScreeningJournalStopsBeforeAnyExternalAction() throws Exception {
+        var config=new BossConfig(); config.setConfirmedProfile(new JobProfileService.Snapshot(1,
+                new JobProfile("开发",List.of("boss"),List.of("Java"),"北京",null,true,List.of(),List.of(),"您好",false,false),1L,""));
+        var worker=new Boss(null,null,null); worker.setConfig(config); worker.setTaskId("task"); worker.setLedger(mock(BossDeliveryLedger.class));
+        worker.setShouldStopCallback(()->false); worker.setScreeningCallback((j,m)->{throw new IllegalStateException("fixture database unavailable");});
+        var listing=mock(Page.class); var more=mock(Locator.class); when(listing.locator("a.more-job-btn")).thenReturn(more); when(more.count()).thenReturn(1); when(more.first()).thenReturn(more); when(more.getAttribute("href")).thenReturn("/job_detail/one.html"); worker.setPage(listing);
+        var job=new Job(); job.setJobName("Java开发"); job.setCompanyName("隔离公司"); job.setJobArea("北京");
+        var method=Boss.class.getDeclaredMethod("resumeSubmission",String.class,Job.class); method.setAccessible(true);
+        var failure=assertThrows(java.lang.reflect.InvocationTargetException.class,()->method.invoke(worker,"Java",job));
+        assertTrue(failure.getCause().getMessage().contains("筛选记录保存失败")); assertEquals("FAILED",worker.getOutcome());
+        verify(listing,never()).context();
     }
 }

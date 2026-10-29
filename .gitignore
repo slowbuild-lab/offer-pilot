@@ -84,3 +84,6 @@ browser-data/*/
 docs/node_modules/
 docs/.vitepress/cache/
 docs/.vitepress/dist/
+
+# Private local backups, never distribute database copies
+/.local-backups/

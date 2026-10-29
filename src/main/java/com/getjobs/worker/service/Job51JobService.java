@@ -23,6 +23,7 @@ import java.util.function.Consumer;
 @Service
 @RequiredArgsConstructor
 public class Job51JobService implements JobPlatformService {
+    @org.springframework.beans.factory.annotation.Autowired private com.getjobs.application.service.DeliveryPacingService pacing;
     private static final String PLATFORM = "51job";
 
     private final PlaywrightManager playwrightManager;
@@ -90,7 +91,9 @@ public class Job51JobService implements JobPlatformService {
             // 跑在 51job 自己的会话线程上，和 BOSS/智联 的浏览器互不影响
             int deliveredCount = playwrightManager.callOn(PLATFORM, page -> {
                 job51.setPage(page);
-                return job51.execute();
+                try(var session=new com.getjobs.worker.utils.DeliveryPacingSession(pacing,PLATFORM,this::shouldStop,m->progressCallback.accept(JobProgressMessage.info(PLATFORM,m)))){
+                    session.attach(page);job51.setPacing(session);int result=job51.execute();if(!shouldStop)session.check();return result;
+                }
             });
 
             progressCallback.accept(JobProgressMessage.success(PLATFORM,

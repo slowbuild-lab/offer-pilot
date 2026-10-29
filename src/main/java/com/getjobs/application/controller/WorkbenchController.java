@@ -1,11 +1,11 @@
 package com.getjobs.application.controller;
 
-import com.getjobs.application.service.ConfigService;
+import com.getjobs.application.service.BossDeliveryLedger;
+import com.getjobs.application.service.DeliveryReadService;
 import com.getjobs.application.service.ZhilianDeliveryLedger;
 import com.getjobs.worker.manager.PlatformTaskGate;
 import com.getjobs.worker.manager.PlaywrightManager;
 import com.getjobs.worker.service.PlatformTaskCoordinator;
-import com.getjobs.worker.zhilian.ZhilianConfig;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.web.bind.annotation.CrossOrigin;
 import org.springframework.web.bind.annotation.GetMapping;
@@ -35,18 +35,20 @@ public class WorkbenchController {
     private final PlatformTaskGate gate;
     private final PlaywrightManager playwrightManager;
     private final ZhilianDeliveryLedger ledger;
-    private final ConfigService configService;
+    private final BossDeliveryLedger boss;
+    private final DeliveryReadService reads;
 
     public WorkbenchController(PlatformTaskCoordinator coordinator,
                                PlatformTaskGate gate,
                                PlaywrightManager playwrightManager,
                                ZhilianDeliveryLedger ledger,
-                               ConfigService configService) {
+                               BossDeliveryLedger boss, DeliveryReadService reads) {
         this.coordinator = coordinator;
         this.gate = gate;
         this.playwrightManager = playwrightManager;
         this.ledger = ledger;
-        this.configService = configService;
+        this.boss = boss;
+        this.reads = reads;
     }
 
     @GetMapping("/summary")
@@ -64,35 +66,28 @@ public class WorkbenchController {
         }
         response.put("platforms", platforms);
 
-        Map<String, Object> today = new LinkedHashMap<>();
-        int unknownCount = 0;
-        try {
-            Map<String, Object> ledgerSummary = ledger.summary(null, 50);
-            int attempts = asInt(ledgerSummary.get("todayAttempts"));
-            int dayLimit = asInt(ledgerSummary.get("effectiveLimit"));
-            today.put("zhilianAttempts", attempts);
-            today.put("zhilianRemaining", asInt(ledgerSummary.get("remainingToday")));
-            today.put("zhilianDayLimit", dayLimit);
-            unknownCount = asInt(ledgerSummary.get("unknownCount"));
-        } catch (Exception e) {
-            log.warn("读取智联投递记录失败: {}", e.getMessage());
-            today.put("zhilianAttempts", null);
-            today.put("zhilianRemaining", null);
-            today.put("error", "投递记录读取失败");
+        Map<String, Map<String,Object>> delivery = deliverySummaries();
+        response.put("delivery", delivery);
+        Map<String,Object> today=new LinkedHashMap<>();
+        var z=delivery.get("zhilian");var b=delivery.get("boss");
+        today.put("zhilianAttempts",z.get("todayAttempts"));
+        today.put("zhilianRemaining",z.get("remainingToday"));
+        today.put("zhilianDayLimit",z.get("effectiveLimit"));
+        today.put("unknownCount",b.containsKey("error") || z.containsKey("error") ? null : asInt(b.get("unknownCount"))+asInt(z.get("unknownCount")));
+        response.put("today",today);
+        for(String platform:List.of("boss","zhilian")) {
+            @SuppressWarnings("unchecked") var view=(Map<String,Object>)platforms.get(platform);
+            var data=delivery.get(platform);
+            for(String field:List.of("todayAttempts","remainingToday","unknownCount","reservedCount","effectiveLimit")) view.put(field,data.get(field));
+            view.put("ledgerError",data.get("error"));
         }
-        today.put("unknownCount", unknownCount);
-        response.put("today", today);
-
-        List<Map<String, Object>> attention = attentionItems(platforms);
-        response.put("attention", Map.of("count", attention.size(), "items", attention));
-
-        List<Map<String, Object>> recent = new ArrayList<>();
-        try {
-            recent = ledger.recentTasks(8);
-        } catch (Exception e) {
-            log.warn("读取最近任务失败: {}", e.getMessage());
+        List<Map<String,Object>> attention=attentionItems(platforms,delivery);
+        try { response.put("recent",reads.recentTasks()); }
+        catch(Exception e) {
+            response.put("recent",List.of());response.put("recentError","最近任务读取失败，请刷新重试");
+            attention.add(item("system","RECORDS_UNAVAILABLE","任务历史读取失败","暂时无法读取任务历史，不能据此判断没有记录","refresh"));
         }
-        response.put("recent", recent);
+        response.put("attention",Map.of("count",attention.size(),"items",attention));
         response.put("timestamp", System.currentTimeMillis());
         return response;
     }
@@ -104,7 +99,7 @@ public class WorkbenchController {
         for (String platform : PLATFORM_ORDER) {
             platforms.put(platform, platformView(platform, statuses.get(platform)));
         }
-        List<Map<String, Object>> items = attentionItems(platforms);
+        List<Map<String, Object>> items = attentionItems(platforms,deliverySummaries());
         return Map.of("success", true, "count", items.size(), "items", items);
     }
 
@@ -118,12 +113,16 @@ public class WorkbenchController {
         }
         Map<String, Object> view = new LinkedHashMap<>();
         view.put("platform", platform);
-        view.put("taskState", taskState);
+        String phase=gate.phase(platform).name();
+        view.put("taskState", "IDLE".equals(phase)?taskState:phase);
         view.put("isRunning", Boolean.TRUE.equals(source.get("isRunning")));
         view.put("isLoggedIn", playwrightManager.isLoggedIn(platform));
         view.put("browserReady", playwrightManager.isBrowserReady(platform));
         view.put("lastMessage", source.getOrDefault("lastMessage", ""));
         view.put("lastMessageType", source.getOrDefault("lastMessageType", "info"));
+        view.put("pacing",source.get("pacing"));
+        view.put("pacingLimit",source.get("pacingLimit"));
+        view.put("pacingUsed",source.get("pacingUsed"));
         view.put("browserError", playwrightManager.lastBrowserError(platform));
         view.put("deliveredCount", asInt(source.get("deliveredCount")));
         // 只有做过并行验证的平台才标"已验证"，猎聘/前程无忧保持"未验证"，不夸大能力
@@ -134,25 +133,25 @@ public class WorkbenchController {
         return view;
     }
 
-    private List<Map<String, Object>> attentionItems(Map<String, Object> platforms) {
-        List<Map<String, Object>> items = new ArrayList<>();
-
-        // 1. 智联待核实的投递结果
-        try {
-            for (Map<String, Object> row : ledger.unknownAttempts()) {
-                Map<String, Object> item = new LinkedHashMap<>();
-                item.put("platform", "zhilian");
-                item.put("kind", "UNKNOWN_RESULT");
-                item.put("ref", row.get("id"));
-                item.put("title", "投递结果待核实");
-                item.put("message", joinJob(row.get("jobTitle"), row.get("company"), row.get("reason")));
-                item.put("action", "open_zhilian_attempts");
-                items.add(item);
+    private Map<String,Map<String,Object>> deliverySummaries() {
+        Map<String,Map<String,Object>> result=new LinkedHashMap<>();
+        for(String platform:List.of("boss","zhilian")) {
+            try { result.put(platform,platform.equals("boss")?boss.summary():ledger.summary(null,50)); }
+            catch(Exception e) {
+                log.warn("[{}] 工作台无法读取账本",platform);
+                result.put(platform,Map.of("error","投递记录暂不可用，请检查本机服务与数据库"));
             }
-        } catch (Exception e) {
-            log.warn("读取待核实记录失败: {}", e.getMessage());
         }
+        return result;
+    }
 
+    private List<Map<String, Object>> attentionItems(Map<String,Object> platforms,Map<String,Map<String,Object>> delivery) {
+        List<Map<String,Object>> items=new ArrayList<>();
+        for(String platform:List.of("boss","zhilian")) {
+            var data=delivery.get(platform);
+            if(data.containsKey("error")) items.add(item(platform,"RECORDS_UNAVAILABLE","投递记录读取失败",String.valueOf(data.get("error")),"refresh"));
+            else if(asInt(data.get("unknownCount"))>0) items.add(item(platform,"UNKNOWN_RESULT","结果待核实",data.get("unknownCount")+" 个岗位结果待核实，次数保留且不会自动重投","open_delivery_records"));
+        }
         // 2. 暂停 / 登录失效 / 任务异常：每个平台最多一条，按严重程度取最高
         for (String platform : PLATFORM_ORDER) {
             @SuppressWarnings("unchecked")
@@ -166,8 +165,11 @@ public class WorkbenchController {
             boolean loggedIn = Boolean.TRUE.equals(view.get("isLoggedIn"));
 
             Map<String, Object> item = null;
-            if ("PAUSED".equals(state)) {
-                item = item(platform, "PAUSED", "任务已暂停", message.isBlank() ? "需要人工处理后继续" : message, "resume");
+            String browserError=java.util.Objects.toString(view.get("browserError"), "");
+            if (!Boolean.TRUE.equals(view.get("browserReady")) && !browserError.isBlank()) {
+                item=item(platform,"BROWSER_ERROR","平台浏览器未能打开","请重新打开该平台浏览器；若再次退出，请从本机终端启动项目并检查权限","login");
+            } else if ("PAUSED".equals(state)) {
+                item = item(platform, "PAUSED", "任务已暂停", message.isBlank() ? "需要人工处理后继续" : message, "zhilian".equals(platform)?"resume":"open_platform");
             } else if (!loggedIn && !message.isBlank() && ("error".equals(type) || "warning".equals(type))) {
                 item = item(platform, "LOGIN_REQUIRED", "登录已失效", message, "login");
             } else if ("error".equals(type) && !message.isBlank() && !"RUNNING".equals(state)) {
@@ -188,35 +190,6 @@ public class WorkbenchController {
         item.put("message", message);
         item.put("action", action);
         return item;
-    }
-
-    private String joinJob(Object title, Object company, Object reason) {
-        StringBuilder builder = new StringBuilder();
-        if (title != null && !String.valueOf(title).isBlank()) {
-            builder.append(title);
-        }
-        if (company != null && !String.valueOf(company).isBlank()) {
-            if (builder.length() > 0) {
-                builder.append(" · ");
-            }
-            builder.append(company);
-        }
-        if (reason != null && !String.valueOf(reason).isBlank()) {
-            if (builder.length() > 0) {
-                builder.append(" · ");
-            }
-            builder.append(reason);
-        }
-        return builder.length() == 0 ? "结果未确认，请人工核实" : builder.toString();
-    }
-
-    private int zhilianDayLimit() {
-        try {
-            ZhilianConfig config = configService.getZhilianConfig();
-            return config.getMaxAttemptsPerDay();
-        } catch (Exception e) {
-            return 50;
-        }
     }
 
     private static int asInt(Object value) {

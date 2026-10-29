@@ -16,6 +16,7 @@ public class DeliveryRecordsController {
     private final BossDeliveryLedger boss;
     private final ZhilianDeliveryLedger zhilian;
     private final DailyQuotaService quota;
+    private final DeliveryReadService reads;
     @ModelAttribute public void localRead(@RequestHeader(value="Origin",required=false) String origin) { localMutation(origin); }
     @GetMapping("/summary") public Map<String,Object> summary() {
         var z=new LinkedHashMap<String,Object>(quota.get("zhilian"));
@@ -23,10 +24,9 @@ public class DeliveryRecordsController {
         return Map.of("boss",boss.summary(),"zhilian",z);
     }
     @GetMapping("/records") public Map<String,Object> records(@RequestParam(defaultValue="boss") String platform,
-                                                               @RequestParam(defaultValue="1") int page) {
-        DailyQuotaService.validatePlatform(platform);
-        if (page<1 || page>10000) throw new IllegalArgumentException("页码必须为 1 到 10000");
-        return Map.of("items","boss".equals(platform)?boss.attempts(page):zhilian.attempts(page),"page",page);
+            @RequestParam(defaultValue="1") int page, @RequestParam(required=false) String from,
+            @RequestParam(required=false) String to, @RequestParam(required=false) String state) {
+        return reads.records(platform,page,from,to,state);
     }
     @PutMapping("/limits/{platform}") public Map<String,Object> limit(@PathVariable String platform,@RequestBody JsonNode body,
                                                         @RequestHeader(value="Origin",required=false) String origin) {

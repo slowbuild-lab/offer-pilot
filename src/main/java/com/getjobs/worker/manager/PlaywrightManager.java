@@ -44,6 +44,7 @@ import java.util.function.Function;
 @Component
 @Lazy
 public class PlaywrightManager {
+    @Autowired @Lazy private com.getjobs.application.service.DeliveryPacingService pacing;
 
     private static final int DEFAULT_TIMEOUT = 30_000;
     private static final double LOCATOR_PROBE_TIMEOUT = 5_000;
@@ -389,6 +390,7 @@ public class PlaywrightManager {
     public void scheduledLoginCheck() {
         for (PlatformBrowserSession session : sessions.values()) {
             try {
+                if(pacing!=null&&!pacing.persistentState(session.platform()).get("paused").toString().isEmpty())continue;
                 session.requestLoginCheck();
             } catch (Exception e) {
                 log.debug("[{}] 定时登录检查异常: {}", session.platform(), e.getMessage());

@@ -28,6 +28,7 @@ import java.util.function.Supplier;
 @Scope("prototype")
 @RequiredArgsConstructor
 public class ZhiLian {
+    @Setter private com.getjobs.worker.utils.DeliveryPacingSession pacing;
 
     @Setter
     private Page page;
@@ -155,7 +156,7 @@ public class ZhiLian {
 
             // 导航到搜索页面（路径参数：jl+城市码 + p1 + sl）
             if (shouldStop()) return;
-            page.navigate(baseUrl);
+            if(pacing!=null)pacing.read(true,()->page.navigate(baseUrl));else page.navigate(baseUrl);
             pauseFor(2);
 
             // 在搜索框输入关键词并触发搜索（Enter键更稳健）
@@ -203,7 +204,7 @@ public class ZhiLian {
                         new Page.WaitForSelectorOptions().setTimeout(10_000));
                 } catch (Exception e) {
                     log.warn("等待岗位列表失败，刷新页面重试");
-                    page.reload();
+                    if(pacing!=null)pacing.read(true,()->page.reload());else page.reload();
                     modernProcessedCount = 0;
                     pauseFor(1);
                 }
@@ -236,6 +237,7 @@ public class ZhiLian {
                 if (nextBtn.count() > 0) {
                     try { nextBtn.first().scrollIntoViewIfNeeded(); } catch (Exception ignored) {}
                     if (shouldStop()) return;
+                    if(pacing!=null)pacing.read(true);
                     nextBtn.first().click();
                     pauseFor(2);
                     pageNum++;
@@ -444,6 +446,7 @@ public class ZhiLian {
                 String previousLink = currentDetailLink();
                 String cardClass = card.getAttribute("class");
                 boolean alreadySelected = cardClass != null && cardClass.contains("job-card--active");
+                if(pacing!=null)pacing.read(false);
                 card.click();
                 if (!alreadySelected && previousLink != null) {
                     page.waitForFunction("""
@@ -503,6 +506,7 @@ public class ZhiLian {
                           .filter(e => e.getClientRects().length > 0 && /投递成功|申请成功/.test(e.textContent)).length
                         """)).intValue();
                 if (shouldStop() || !allowPage()) return false;
+                if(pacing!=null&&!pacing.open(jobId,title,link))continue;
                 if (ledger != null) {
                     var reservation = ledger.reserve(taskId, entity);
                     if (reservation.decision() == ZhilianDeliveryLedger.Decision.DUPLICATE) {
@@ -527,6 +531,10 @@ public class ZhiLian {
                     if (attemptId != null) { ledger.cancelBeforeClick(attemptId); attemptId=null; }
                     end(Outcome.PAUSED, denied.getMessage()); return false;
                 }
+                if(pacing!=null){
+                    if(!jobId.equals(extractJobIdFromLink(currentDetailLink())))pacing.pause("排队期间智联岗位已变化，已取消外发");
+                    pacing.arm();
+                }
                 applyButton.click();
                 try {
                     page.waitForFunction("""
@@ -548,6 +556,7 @@ public class ZhiLian {
                     continue;
                 }
                 if (attemptId != null) { ledger.confirm(attemptId); attemptId = null; }
+                if(pacing!=null)pacing.complete(true);
                 consecutiveFailures = 0;
                 zhilianService.markDeliveredByJobId(jobId);
                 Job job = new Job();
@@ -581,6 +590,7 @@ public class ZhiLian {
                 log.warn("处理新版智联岗位【{}】失败：{}", title, e.getMessage());
                 sendProgress("处理岗位失败：" + title + "，" + e.getMessage(), null, null);
             } finally {
+                if(pacing!=null)pacing.cancel();
                 modernProcessedCount = i + 1;
             }
         }
@@ -594,6 +604,7 @@ public class ZhiLian {
         if (cards.count() > processedCount) return true;
         if (cards.count() == 0) return false;
         Locator lastCard = cards.last();
+        if(pacing!=null)pacing.read(true);
         lastCard.scrollIntoViewIfNeeded();
         lastCard.hover();
         page.mouse().wheel(0, 900);
@@ -917,8 +928,10 @@ public class ZhiLian {
     }
 
     private boolean allowPage() {
+        if(pacing!=null)pacing.check();
         var block = ZhilianPageGuard.inspect(page);
         if (block == ZhilianPageGuard.Block.NONE) return true;
+        if(pacing!=null)pacing.pause(block.message);
         end(block == ZhilianPageGuard.Block.PLATFORM_LIMIT ? Outcome.PLATFORM_LIMIT : Outcome.PAUSED, block.message);
         return false;
     }

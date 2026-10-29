@@ -38,6 +38,9 @@ public class BossJobService implements JobPlatformService {
     private volatile String currentTaskId;
     private final com.getjobs.application.service.JobProfileService profiles;
     private final com.getjobs.application.service.JobProfileRuntime profileRuntime;
+    private final com.getjobs.application.service.CandidateScreeningService screenings;
+    private final com.getjobs.application.service.ContactGuard contacts;
+    @org.springframework.beans.factory.annotation.Autowired private com.getjobs.application.service.DeliveryPacingService pacing;
 
     private volatile boolean isRunning = false;
     private volatile boolean shouldStop = false;
@@ -53,7 +56,9 @@ public class BossJobService implements JobPlatformService {
                           PlatformTaskGate gate,
                           com.getjobs.application.service.BossDeliveryLedger ledger,
                           com.getjobs.application.service.JobProfileService profiles,
-                          com.getjobs.application.service.JobProfileRuntime profileRuntime) {
+                          com.getjobs.application.service.JobProfileRuntime profileRuntime,
+                          com.getjobs.application.service.CandidateScreeningService screenings,
+                          com.getjobs.application.service.ContactGuard contacts) {
         this.playwrightManager = playwrightManager;
         this.configService = configService;
         this.bossProvider = bossProvider;
@@ -61,6 +66,8 @@ public class BossJobService implements JobPlatformService {
         this.ledger = ledger;
         this.profiles = profiles;
         this.profileRuntime = profileRuntime;
+        this.screenings = screenings;
+        this.contacts = contacts;
     }
 
     @Override
@@ -110,7 +117,13 @@ public class BossJobService implements JobPlatformService {
             Boss boss = bossProvider.getObject();
             boss.setLedger(ledger);
             boss.setTaskId(currentTaskId);
+            if (snapshot!=null) {
+                String screeningTask=currentTaskId;
+                boss.setScreeningCallback((job,result)->screenings.record(screeningTask,snapshot.version(),job,result));
+                boss.setCooldownCheck(job -> contacts.evaluate(snapshot.rules().contactPolicy(), job));
+            }
             boss.setExternalGuard(job -> profileRuntime.guard(snapshot, job));
+            boss.setContactCallback(contacts::record);
             boss.setConfig(config);
             boss.setShouldStopCallback(this::shouldStop);
             boss.setProgressCallback((message, current, total) -> {
@@ -134,7 +147,9 @@ public class BossJobService implements JobPlatformService {
             // 整个投递流程跑在 boss 会话线程上，Page 也在该线程内取用
             int count = playwrightManager.callOn(PLATFORM, page -> {
                 boss.setPage(page);
-                return boss.execute();
+                try(var session=new com.getjobs.worker.utils.DeliveryPacingSession(pacing,PLATFORM,this::shouldStop,m->progress.accept(JobProgressMessage.info(PLATFORM,m)))){
+                    session.attach(page);boss.setPacing(session);int result=boss.execute();if(!shouldStop)session.check();return result;
+                }
             });
             deliveredCount = count;
             finalState = shouldStop ? "STOPPED" : boss.getOutcome();
@@ -148,7 +163,7 @@ public class BossJobService implements JobPlatformService {
             }
         } catch (Exception e) {
             log.error("Boss投递任务执行失败", e);
-            finalState = "FAILED";
+            finalState = shouldStop?"STOPPED":e instanceof com.getjobs.worker.utils.DeliveryPacingSession.Halt?"PAUSED":"FAILED";
             progress.accept(JobProgressMessage.error(PLATFORM, "投递失败: " + e.getMessage()));
         } finally {
             if (currentTaskId != null) {

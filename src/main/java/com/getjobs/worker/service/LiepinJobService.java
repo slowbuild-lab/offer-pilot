@@ -25,6 +25,7 @@ import java.util.function.Consumer;
 @Service
 @RequiredArgsConstructor
 public class LiepinJobService implements JobPlatformService {
+    @org.springframework.beans.factory.annotation.Autowired private com.getjobs.application.service.DeliveryPacingService pacing;
 
     private static final String PLATFORM = "liepin";
 
@@ -84,7 +85,9 @@ public class LiepinJobService implements JobPlatformService {
             // 必须跑在猎聘自己的会话线程上，和 BOSS/智联 的浏览器互不影响
             int deliveredCount = playwrightManager.callOn(PLATFORM, page -> {
                 liepin.setPage(page);
-                return liepin.execute();
+                try(var session=new com.getjobs.worker.utils.DeliveryPacingSession(pacing,PLATFORM,this::shouldStop,m->progressCallback.accept(JobProgressMessage.info(PLATFORM,m)))){
+                    session.attach(page);liepin.setPacing(session);int result=liepin.execute();if(!shouldStop)session.check();return result;
+                }
             });
 
             progressCallback.accept(JobProgressMessage.success(PLATFORM,

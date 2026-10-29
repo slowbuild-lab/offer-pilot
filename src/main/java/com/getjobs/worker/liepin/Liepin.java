@@ -33,6 +33,7 @@ import static com.getjobs.worker.liepin.Locators.*;
 @Component
 @Scope("prototype")
 public class Liepin {
+    @Setter private com.getjobs.worker.utils.DeliveryPacingSession pacing;
     static {
         // 在类加载时就设置日志文件名，确保Logger初始化时能获取到正确的属性
         System.setProperty("log.name", "liepin");
@@ -230,7 +231,8 @@ public class Liepin {
         // 清洗关键词：去掉前后引号与多余空白
         String cleanKeyword = keyword == null ? "" : keyword.replace("\"", "").trim();
         lastApiEntities.clear();
-        page.navigate(getSearchUrl() + "&key=" + cleanKeyword);
+        String search=getSearchUrl()+"&key="+java.net.URLEncoder.encode(cleanKeyword,java.nio.charset.StandardCharsets.UTF_8);
+        if(pacing!=null)pacing.read(true,()->page.navigate(search));else page.navigate(search);
         
         // 等待分页元素加载
         page.waitForSelector(PAGINATION_BOX, new Page.WaitForSelectorOptions().setTimeout(10000));
@@ -282,6 +284,7 @@ public class Liepin {
                 String cls = nextLi.first().getAttribute("class");
                 boolean disabled = cls != null && cls.contains("ant-pagination-disabled");
                 if (!disabled) {
+                    if(pacing!=null)pacing.read(true);
                     lastApiEntities.clear(); // 下一页接口数据到达前不要沿用上一页的
                     Locator btn = nextLi.first().locator("button.ant-pagination-item-link");
                     if (btn.count() > 0) {
@@ -338,6 +341,7 @@ public class Liepin {
                 info("收到停止指令，结束卡片遍历");
                 return;
             }
+            if(pacing!=null)pacing.read(false);
             // 获取当前岗位卡片（用于后续操作与缺省展示）
             Locator currentJobCard = page.locator(JOB_CARDS).nth(i);
             // 从接口数据获取展示所需字段，若接口数据缺失则使用缺省占位，仍尝试打招呼
@@ -502,82 +506,33 @@ public class Liepin {
                 continue;
             }
             
-            // 提取 jobId（用于更新投递状态）
-            Long jobIdForUpdate = null;
-            if (i < lastApiEntities.size()) {
-                jobIdForUpdate = lastApiEntities.get(i).getJobId();
-            }
-            if (jobIdForUpdate == null) {
-                jobIdForUpdate = extractJobIdFromCard(currentJobCard);
-            }
+            // Identity must come from this DOM card; API ordering is not a safe association.
+            Long jobIdForUpdate=extractJobIdFromCard(currentJobCard);
 
             // 检查按钮文本并点击
             if (button != null && buttonText.contains("聊一聊")) {
+                if(pacing==null)throw new IllegalStateException("猎聘限速保护未绑定，禁止外发");
+                if(jobIdForUpdate==null)pacing.pause("猎聘岗位编号无法可靠识别，已停止外发");
+                String link="https://www.liepin.com/job/"+jobIdForUpdate+".shtml";
+                if(!pacing.open(jobIdForUpdate.toString(),jobName,link))continue;
                 try {
-                    // 在点击按钮前进行鼠标微调，先向右移动2像素，再向左移动2像素
-                    try {
-                        var boundingBox = button.boundingBox();
-                        if (boundingBox != null) {
-                            double centerX = boundingBox.x + boundingBox.width / 2;
-                            double centerY = boundingBox.y + boundingBox.height / 2;
-                            
-                            // 先移动到按钮中心
-                            page.mouse().move(centerX, centerY);
-                            Thread.sleep(50);
-                            
-                            // 向右移动2像素
-                            page.mouse().move(centerX + 2, centerY);
-                            Thread.sleep(50);
-                            
-                            // 向左移动2像素（回到中心再向左2像素）
-                            page.mouse().move(centerX - 2, centerY);
-                            Thread.sleep(50);
-                            
-                            // 回到中心位置
-                            page.mouse().move(centerX, centerY);
-                            Thread.sleep(50);
-                            
-                            log.debug("完成鼠标微调，准备点击按钮");
-                        }
-                    } catch (Exception moveError) {
-                        log.warn("鼠标微调失败，直接点击按钮: {}", moveError.getMessage());
-                    }
-                    
+                    if(!jobIdForUpdate.equals(extractJobIdFromCard(currentJobCard)))pacing.pause("排队期间猎聘岗位已变化，已取消外发");
+                    var originalButton=button.elementHandle();
+                    pacing.arm();
                     button.click();
-                    // PlaywrightUtil.sleep(1); // 等待点击响应
-                    
-                    // 猎聘会自动发送打招呼语，所以我们只需要关闭聊天窗口
+                    boolean confirmed=false;
                     try {
-                        // 等待聊天界面加载
-                        page.waitForSelector(CHAT_HEADER, new Page.WaitForSelectorOptions().setTimeout(3000));
-                        
-                        // 直接关闭聊天窗口
-                        Locator close = page.locator(CHAT_CLOSE);
-                        if (close.count() > 0) {
-                            PlaywrightUtil.sleep(1);
-                            close.click();
-                        }
-                        
-                        resultList.add(sb.append("【").append(companyName).append(" ").append(jobName).append(" ").append(salary).append(" ").append(recruiterName).append(" ").append("】").toString());
-                        sb.setLength(0);
-                        // 点击成功后标记为已投递
-                        if (jobIdForUpdate != null) {
-                            liepinService.markDelivered(jobIdForUpdate);
-                        }
-                        
-                    } catch (Exception e) {
-                        log.warn("关闭聊天窗口失败，但投递可能已成功: {}", e.getMessage());
-                        // 即使关闭失败，也认为投递成功
-                        resultList.add(sb.append("【").append(companyName).append(" ").append(jobName).append(" ").append(salary).append(" ").append(recruiterName).append(" ").append("】").toString());
-                        sb.setLength(0);
-                        if (jobIdForUpdate != null) {
-                            liepinService.markDelivered(jobIdForUpdate);
-                        }
-                    }
-                    
-                } catch (Exception e) {
-                    log.error("点击按钮失败: {}", e.getMessage());
-                }
+                        // Opening a chat window alone does not prove that the greeting was accepted.
+                        page.waitForFunction("el => el && /继续聊|已沟通/.test(el.textContent)",originalButton,new Page.WaitForFunctionOptions().setTimeout(10000));
+                        confirmed=true;
+                    }catch(com.microsoft.playwright.TimeoutError timeout){ /* Preserve UNKNOWN. */ }
+                    pacing.complete(confirmed);
+                    if(!confirmed)pacing.pause("猎聘沟通结果未确认，请人工核实");
+                    liepinService.markDelivered(jobIdForUpdate);
+                    resultList.add("【"+companyName+" "+jobName+"】");
+                    Locator close=page.locator(CHAT_CLOSE);
+                    if(close.count()>0)close.first().click();
+                }finally{pacing.cancel();}
             } else {
                 // 如果按钮是“继续聊”，视为已投递
                 if (button != null && buttonText.contains("继续聊") && jobIdForUpdate != null) {

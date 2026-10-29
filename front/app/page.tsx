@@ -1,6 +1,7 @@
 'use client'
 
 import Link from 'next/link'
+import { useRouter } from 'next/navigation'
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { BiErrorCircle, BiPlay, BiRefresh, BiStop } from 'react-icons/bi'
 import { Button } from '@/components/ui/button'
@@ -11,12 +12,17 @@ import PageHeader from '@/app/components/PageHeader'
 import { API_BASE } from '@/lib/api'
 import { PLATFORM_META, platformName, runPreflight, type PreflightResult } from '@/lib/preflight'
 
+interface DeliverySummary { todayAttempts?: number; reservedCount?: number; remainingToday?: number; effectiveLimit?: number; unknownCount?: number; error?: string }
+
 interface Summary {
   parallel: { maxParallel: number; runningCount: number; activeCount: number; activePlatforms: string[] }
   platforms: Record<string, PlatformView>
-  today: { zhilianAttempts: number | null; zhilianRemaining: number | null; zhilianDayLimit: number; unknownCount: number; error?: string }
+  today: { zhilianAttempts: number | null; zhilianRemaining: number | null; zhilianDayLimit: number; unknownCount: number | null; error?: string }
   attention: { count: number; items: AttentionItem[] }
-  recent: { id: string; state: string; reason: string; startedAt: number }[]
+  delivery: Record<string, DeliverySummary>
+  recent: { id: string; platform: string; state: string; reason: string; startedAt: number }[]
+  recentError?: string
+  timestamp: number
 }
 
 interface AttentionItem {
@@ -35,16 +41,18 @@ const RECENT_STATE: Record<string, string> = {
 
 function formatTime(value: number) {
   try {
-    return new Date(value).toLocaleString('zh-CN', { hour12: false, month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })
+    return new Date(value).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai', hour12: false, month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })
   } catch {
     return '—'
   }
 }
 
 export default function WorkbenchPage() {
+  const router = useRouter()
   const [summary, setSummary] = useState<Summary | null>(null)
   const [offline, setOffline] = useState(false)
-  const [busy, setBusy] = useState<string | null>(null)
+  const [busy, setBusy] = useState<Record<string, boolean>>({})
+  const anyBusy = Object.values(busy).some(Boolean)
   const [message, setMessage] = useState<{ text: string; type: 'info' | 'warning' | 'error' } | null>(null)
   const [preflight, setPreflight] = useState<PreflightResult | null>(null)
   const polling = useRef(false)
@@ -53,7 +61,7 @@ export default function WorkbenchPage() {
     if (polling.current) return
     polling.current = true
     try {
-      const response = await fetch(`${API_BASE}/api/workbench/summary`)
+      const response = await fetch(`${API_BASE}/api/workbench/summary`, { signal: AbortSignal.timeout(8000), cache: 'no-store' })
       if (!response.ok) throw new Error(`status ${response.status}`)
       setSummary(await response.json())
       setOffline(false)
@@ -71,21 +79,29 @@ export default function WorkbenchPage() {
   }, [refresh])
 
   const call = async (url: string, body?: unknown) => {
-    const response = await fetch(`${API_BASE}${url}`, {
-      method: 'POST',
-      headers: body ? { 'Content-Type': 'application/json' } : undefined,
-      body: body ? JSON.stringify(body) : undefined,
-    })
-    const data = await response.json().catch(() => ({}))
-    return { ok: response.ok, data } as { ok: boolean; data: { success?: boolean; message?: string } }
+    try {
+      const response = await fetch(`${API_BASE}${url}`, {
+        method: 'POST', signal: AbortSignal.timeout(15000),
+        headers: body ? { 'Content-Type': 'application/json' } : undefined,
+        body: body ? JSON.stringify(body) : undefined,
+      })
+      const data = await response.json().catch(() => ({}))
+      return { ok: response.ok, data: { ...data, success: response.ok && data.success === true } }
+    } catch {
+      return { ok: false, data: { success: false, message: '请求未获确认，请刷新查看实际状态，勿连续重复点击；开始或停止请求可能已被服务接收。' } }
+    }
   }
 
   const start = async (platform: string) => {
-    setBusy(platform)
+    setBusy(current => ({ ...current, [platform]: true }))
     try {
-      // 预检只是把错误提前；接口不可用时仍然走原有启动流程
+      // 预检失败时不继续启动，避免状态不明时外发。
       const pre = await runPreflight(platform)
-      if (pre && !pre.ready) {
+      if (!pre) {
+        setMessage({ type: 'error', text: '启动预检未完成，请检查本机服务后重试；没有发起启动请求。' })
+        return
+      }
+      if (!pre.ready) {
         setPreflight(pre)
         return
       }
@@ -95,54 +111,60 @@ export default function WorkbenchPage() {
       const { data } = await call(PLATFORM_META[platform].start)
       setMessage({ type: data.success ? 'info' : 'error', text: data.message || (data.success ? '已启动' : '启动失败') })
     } finally {
-      setBusy(null)
+      setBusy(current => ({ ...current, [platform]: false }))
       await refresh()
     }
   }
 
   const stop = async (platform: string) => {
-    setBusy(platform)
+    setBusy(current => ({ ...current, [platform]: true }))
     try {
       const { data } = await call(PLATFORM_META[platform].stop)
-      setMessage({ type: data.success ? 'warning' : 'error', text: data.message || '停止请求已发送' })
+      setMessage({ type: data.success ? 'warning' : 'error', text: data.message || (data.success ? '停止请求已发送' : '停止请求未获确认，请刷新核对任务状态') })
     } finally {
-      setBusy(null)
+      setBusy(current => ({ ...current, [platform]: false }))
       await refresh()
     }
   }
 
   const resume = async (platform: string) => {
-    setBusy(platform)
+    setBusy(current => ({ ...current, [platform]: true }))
     try {
       const { data } = await call('/api/zhilian/resume')
-      setMessage({ type: data.success ? 'info' : 'error', text: data.message || '继续请求已发送' })
+      setMessage({ type: data.success ? 'info' : 'error', text: data.message || (data.success ? '继续请求已发送' : '继续请求失败，请检查服务状态') })
     } finally {
-      setBusy(null)
+      setBusy(current => ({ ...current, [platform]: false }))
       await refresh()
     }
   }
 
   const login = async (platform: string) => {
-    setBusy(platform)
+    setBusy(current => ({ ...current, [platform]: true }))
     try {
       const { data } = await call(`/api/platforms/${platform}/login`)
-      setMessage({ type: data.success ? 'info' : 'error', text: data.message || '正在打开浏览器' })
+      setMessage({ type: data.success ? 'info' : 'error', text: data.message || (data.success ? '正在打开浏览器' : '打开浏览器失败，请检查服务状态') })
     } finally {
-      setBusy(null)
+      setBusy(current => ({ ...current, [platform]: false }))
       await refresh()
     }
   }
 
   const forceStop = async (platform: string) => {
-    const { data } = await call(`/api/platforms/${platform}/force-stop`)
-    setMessage({ type: 'warning', text: data.message || '已请求强制结束' })
-    await refresh()
+    if (!window.confirm(`强制关闭${platformName(platform)}专用浏览器？已发出的结果仍需核实，其他平台不受影响。`)) return
+    setBusy(current => ({ ...current, [platform]: true }))
+    try {
+      const { data } = await call(`/api/platforms/${platform}/force-stop`)
+      setMessage({ type: data.success ? 'warning' : 'error', text: data.message || '强制结束请求未获确认' })
+    } finally { setBusy(current => ({ ...current, [platform]: false })); await refresh() }
   }
 
   const stopAll = async () => {
-    const { data } = await call('/api/platforms/stop-all')
-    setMessage({ type: 'warning', text: data.message || '已发送停止请求' })
-    await refresh()
+    if (!window.confirm('停止全部正在运行的任务？已发送的消息和申请不能撤回，未确认结果仍会保留。')) return
+    setBusy(current => ({ ...current, all: true }))
+    try {
+      const { data } = await call('/api/platforms/stop-all')
+      setMessage({ type: data.success ? 'warning' : 'error', text: data.message || '全部停止请求未获确认' })
+    } finally { setBusy(current => ({ ...current, all: false })); await refresh() }
   }
 
   const pre = summary?.parallel
@@ -151,13 +173,18 @@ export default function WorkbenchPage() {
   const order = ['boss', 'zhilian', 'liepin', '51job'].filter((p) => platforms[p])
 
   const handleAttention = async (item: AttentionItem) => {
+    if (item.action === 'refresh') return refresh()
+    if (item.action === 'open_delivery_records') {
+      router.push(`/delivery-records?platform=${encodeURIComponent(item.platform)}&state=UNKNOWN&range=all`)
+      return
+    }
     if (item.action === 'resume') return resume(item.platform)
     if (item.action === 'login') return login(item.platform)
     if (item.action === 'open_zhilian_attempts') {
-      window.location.href = '/zhilian'
+      router.push('/zhilian')
       return
     }
-    window.location.href = PLATFORM_META[item.platform]?.page || '/'
+    router.push(PLATFORM_META[item.platform]?.page || '/')
   }
 
   return (
@@ -173,7 +200,7 @@ export default function WorkbenchPage() {
             <Button size="sm" variant="outline" className="rounded-full px-4" onClick={refresh}>
               <BiRefresh className="mr-1" /> 刷新
             </Button>
-            <Button size="sm" variant="outline" className="rounded-full border-amber-500 px-4 text-amber-600" onClick={stopAll}>
+            <Button size="sm" variant="outline" className="rounded-full border-amber-500 px-4 text-amber-600" disabled={offline || !summary || busy.all || !pre?.activeCount} onClick={stopAll}>
               <BiStop className="mr-1" /> 全部停止
             </Button>
           </div>
@@ -185,6 +212,8 @@ export default function WorkbenchPage() {
           无法连接后端服务（{API_BASE}），页面显示的是上一次状态。
         </div>
       )}
+
+      <p className="text-xs text-muted-foreground">{summary ? `最近更新：${formatTime(summary.timestamp)}（北京时间）` : offline ? '尚未取得服务状态' : '正在读取状态…'}</p>
 
       {message && (
         <div role="status" aria-live="polite" className={`rounded-lg border p-4 text-sm ${
@@ -205,9 +234,9 @@ export default function WorkbenchPage() {
           )}
         </CardContent></Card>
         <Card className="rounded-xl"><CardContent className="p-4">
-          <p className="text-sm text-muted-foreground">智联今日尝试</p>
-          <p className="text-2xl font-medium">{today?.zhilianAttempts ?? '—'}</p>
-          <p className="text-xs text-muted-foreground">仅统计本工具记录的智联尝试</p>
+          <p className="text-sm text-muted-foreground">今日岗位尝试</p>
+          <p className="text-lg font-medium">BOSS {summary?.delivery.boss?.todayAttempts ?? '—'} · 智联 {summary?.delivery.zhilian?.todayAttempts ?? '—'}</p>
+          <p className="text-xs text-muted-foreground">预留单列；仅统计本工具记录</p>
         </CardContent></Card>
         <Card className="rounded-xl"><CardContent className="p-4">
           <p className="text-sm text-muted-foreground">结果待核实</p>
@@ -230,7 +259,8 @@ export default function WorkbenchPage() {
           <PlatformCard
             key={platform}
             view={platforms[platform]}
-            busy={busy}
+            busy={busy.all ? 'all' : busy[platform] ? platform : null}
+            unavailable={offline || !summary}
             onStart={start}
             onStop={stop}
             onResume={resume}
@@ -251,12 +281,12 @@ export default function WorkbenchPage() {
             <div key={`${item.platform}-${item.kind}-${item.ref || ''}`} className="flex flex-wrap items-center justify-between gap-2 rounded-lg border p-3">
               <div className="min-w-0">
                 <p className="text-sm font-medium">
-                  <span className="mr-2 rounded bg-muted px-2 py-0.5 text-xs text-muted-foreground">{platformName(item.platform)}</span>
+                  <span className="mr-2 rounded bg-muted px-2 py-0.5 text-xs text-muted-foreground">{item.platform === 'system' ? '系统' : platformName(item.platform)}</span>
                   {item.title}
                 </p>
                 <p className="mt-1 truncate text-xs text-muted-foreground" title={item.message}>{item.message}</p>
               </div>
-              <Button size="sm" variant="outline" className="rounded-full px-3" onClick={() => handleAttention(item)}>
+              <Button size="sm" variant="outline" className="rounded-full px-3" disabled={offline || anyBusy} onClick={() => handleAttention(item)}>
                 {item.action === 'resume' ? '去继续' : item.action === 'login' ? '去登录' : '去处理'}
               </Button>
             </div>
@@ -265,16 +295,18 @@ export default function WorkbenchPage() {
       </Card>
 
       <Card className="rounded-xl">
-        <CardHeader className="pb-2"><CardTitle className="text-base">最近任务（智联）</CardTitle></CardHeader>
+        <CardHeader className="pb-2"><CardTitle className="text-base">最近任务（BOSS / 智联）</CardTitle></CardHeader>
         <CardContent>
-          {(!summary || summary.recent.length === 0) && (
+          {summary?.recentError && <p role="alert" className="text-sm text-red-600">{summary.recentError}</p>}
+          {(!summary || (!summary.recentError && summary.recent.length === 0)) && (
             <p className="text-sm text-muted-foreground">
-              {summary ? '还没有智联任务记录。BOSS 暂未保存任务历史，本次不伪造跨平台记录。' : '加载中…'}
+              {summary ? '还没有本工具记录的 BOSS 或智联任务。' : '加载中…'}
             </p>
           )}
           <ul className="space-y-2">
             {summary?.recent.map((task) => (
-              <li key={task.id} className="flex items-center justify-between gap-3 text-sm">
+              <li key={`${task.platform}-${task.id}`} className="flex flex-wrap items-center justify-between gap-3 text-sm">
+                <span className="text-xs font-medium">{platformName(task.platform)}</span>
                 <span className="text-muted-foreground">{formatTime(task.startedAt)}</span>
                 <span className="rounded bg-muted px-2 py-0.5 text-xs">{RECENT_STATE[task.state] || task.state}</span>
                 <span className="min-w-0 flex-1 truncate text-right text-muted-foreground" title={task.reason || ''}>

@@ -5,12 +5,106 @@ import java.util.regex.Pattern;
 
 public record JobProfile(String name, List<String> platforms, List<String> keywords, String city,
                          Integer minimumMonthlySalary, boolean salaryHard, List<String> excludeCompanies,
-                         List<String> excludeJobs, String bossMessage, boolean bossImage, boolean zhilianResumeConfirmed) {
-    public record Match(boolean eligible, String reason) {}
+                         List<String> excludeJobs, String bossMessage, boolean bossImage, boolean zhilianResumeConfirmed,
+                         BossFilters bossFilters, ContactPolicy contactPolicy) {
+    public record RuleCheck(String code,String label,boolean passed,String term,String evidence,String reason) {}
+    public record Match(boolean eligible, String reason, List<RuleCheck> checks) {
+        public Match { checks=checks==null?List.of():List.copyOf(checks); }
+        public Match(boolean eligible,String reason) { this(eligible,reason,List.of()); }
+        public Match reject(String code,String label,String reason,String evidence) {
+            var all=new ArrayList<>(checks); all.add(new RuleCheck(code,label,false,"",evidence,reason));
+            return new Match(false,reason,all);
+        }
+        /** Appends a check that may be decided outside the pure rules (for example a database lookup). */
+        public Match with(RuleCheck check) {
+            var all=new ArrayList<>(checks); all.add(check);
+            boolean eligible=this.eligible && check.passed();
+            return new Match(eligible,eligible?reason:check.reason(),all);
+        }
+    }
+    public JobProfile(String name,List<String> platforms,List<String> keywords,String city,Integer minimumMonthlySalary,
+                      boolean salaryHard,List<String> excludeCompanies,List<String> excludeJobs,String bossMessage,
+                      boolean bossImage,boolean zhilianResumeConfirmed) {
+        this(name,platforms,keywords,city,minimumMonthlySalary,salaryHard,excludeCompanies,excludeJobs,bossMessage,bossImage,zhilianResumeConfirmed,null,null);
+    }
+    public JobProfile(String name,List<String> platforms,List<String> keywords,String city,Integer minimumMonthlySalary,
+                      boolean salaryHard,List<String> excludeCompanies,List<String> excludeJobs,String bossMessage,
+                      boolean bossImage,boolean zhilianResumeConfirmed,BossFilters bossFilters) {
+        this(name,platforms,keywords,city,minimumMonthlySalary,salaryHard,excludeCompanies,excludeJobs,bossMessage,bossImage,zhilianResumeConfirmed,bossFilters,null);
+    }
+    /** Optional BOSS-only HR cooldown. Absent (null days) means disabled, so old profiles keep their exact behaviour. */
+    public record ContactPolicy(Integer hrCooldownDays) {
+        public static final int MAX_DAYS=365;
+        public ContactPolicy {
+            if (hrCooldownDays!=null && (hrCooldownDays<1 || hrCooldownDays>MAX_DAYS))
+                throw new IllegalArgumentException("BOSS HR 冷却期必须为 1 到 "+MAX_DAYS+" 天");
+        }
+        public boolean enabled() { return hrCooldownDays!=null; }
+    }
+    public record BossFilters(List<String> includeCompanies,List<String> descriptionInclude,List<String> descriptionExclude) {
+        private static final Pattern NEGATION=Pattern.compile("(?:不是|并非|不属于|不涉及|无需|不需要|无须|没有|非)\\s*$");
+        public BossFilters {
+            includeCompanies=values(includeCompanies,20,100,"BOSS公司白名单");
+            descriptionInclude=values(descriptionInclude,20,100,"BOSS工作内容包含词");
+            descriptionExclude=values(descriptionExclude,20,100,"BOSS工作内容排除词");
+        }
+        public boolean configured() { return !includeCompanies.isEmpty() || !descriptionInclude.isEmpty() || !descriptionExclude.isEmpty(); }
+        public List<RuleCheck> evaluate(JobCandidate job) {
+            var checks=new ArrayList<RuleCheck>();
+            if (!includeCompanies.isEmpty()) {
+                String hit=includeCompanies.stream().filter(t -> normal(job.company()).contains(normal(t))).findFirst().orElse("");
+                checks.add(new RuleCheck("BOSS_COMPANY_INCLUDE","公司白名单",!hit.isEmpty(),hit,
+                        job.company()==null?"":job.company(),!hit.isEmpty()?"公司命中白名单："+hit:"公司名称缺失或未命中任一白名单词"));
+            }
+            if (descriptionInclude.isEmpty() && descriptionExclude.isEmpty()) return checks;
+            String description=job.description();
+            if (description==null || description.isBlank() || description.length()>100000) {
+                checks.add(new RuleCheck("BOSS_DESCRIPTION_AVAILABLE","工作内容完整性",false,"","",
+                        description!=null && description.length()>100000?"岗位工作内容过长，无法完整核验":"岗位工作内容缺失，无法核验BOSS高级筛选"));
+                return checks;
+            }
+            if (!descriptionInclude.isEmpty()) {
+                var hit=hit(description,descriptionInclude);
+                checks.add(new RuleCheck("BOSS_DESCRIPTION_INCLUDE","工作内容至少包含一项",hit!=null,hit==null?"":hit.term(),
+                        excerpt(description,hit==null?0:hit.index()),hit==null?"工作内容未命中任一包含词":"工作内容命中包含词："+hit.term()));
+            }
+            if (!descriptionExclude.isEmpty()) {
+                var hit=hit(description,descriptionExclude);
+                checks.add(new RuleCheck("BOSS_DESCRIPTION_EXCLUDE","工作内容排除",hit==null,hit==null?"":hit.term(),
+                        excerpt(description,hit==null?0:hit.index()),hit==null?"未命中有效排除词；明确否定及销售系统/软件/工具语境不作命中":"工作内容命中排除词："+hit.term()));
+            }
+            return checks;
+        }
+        private record Hit(String term,int index) {}
+        private static Hit hit(String description,List<String> terms) {
+            for(String term:terms) {
+                String needle=normal(term);
+                var occurrences=Pattern.compile(Pattern.quote(term),Pattern.CASE_INSENSITIVE|Pattern.UNICODE_CASE).matcher(description);
+                while(occurrences.find()) {
+                    int at=occurrences.start();
+                    String before=description.substring(Math.max(0,at-12),at);
+                    String after=description.substring(occurrences.end());
+                    boolean qualification=List.of("经验","背景","技能","资格").stream().anyMatch(after::startsWith);
+                    boolean negated=!qualification && NEGATION.matcher(before).find();
+                    boolean software=needle.equals("销售") && (after.startsWith("系统") || after.startsWith("软件") || after.startsWith("工具"));
+                    if (!negated && !software) return new Hit(term,at);
+                }
+            }
+            return null;
+        }
+    }
+    private static String excerpt(String text,int at) {
+        int start=Math.max(0,at-40),end=Math.min(text.length(),at+120);
+        return (start>0?"…":"")+text.substring(start,end)+(end<text.length()?"…":"");
+    }
     public JobProfile {
         name=required(name,30,"方案名称"); city=required(city,50,"目标城市");
         platforms=values(platforms,2,20,"平台"); if (platforms.isEmpty()) throw new IllegalArgumentException("请至少选择一个平台");
         for (String p:platforms) DailyQuotaService.validatePlatform(p);
+        bossFilters=bossFilters==null?new BossFilters(null,null,null):bossFilters;
+        if (bossFilters.configured() && !platforms.contains("boss")) throw new IllegalArgumentException("BOSS高级条件需要选择BOSS平台");
+        contactPolicy=contactPolicy==null?new ContactPolicy(null):contactPolicy;
+        if (contactPolicy.enabled() && !platforms.contains("boss")) throw new IllegalArgumentException("BOSS HR 冷却期需要选择BOSS平台");
         keywords=values(keywords,10,50,"关键词"); if (keywords.isEmpty()) throw new IllegalArgumentException("请填写关键词");
         excludeCompanies=values(excludeCompanies,50,100,"公司排除项"); excludeJobs=values(excludeJobs,50,100,"岗位排除项");
         if (minimumMonthlySalary!=null && (minimumMonthlySalary<0 || minimumMonthlySalary>100000000)) throw new IllegalArgumentException("最低月薪必须是有效的非负整数");
@@ -35,6 +129,17 @@ public record JobProfile(String name, List<String> platforms, List<String> keywo
         return value.endsWith("市")?value.substring(0,value.length()-1):value;
     }
     public Match match(JobCandidate job) {
+        var basic=basicMatch(job);
+        var checks=new ArrayList<RuleCheck>();
+        checks.add(new RuleCheck("BASE","基础条件",basic.eligible(),"",String.join(" · ",
+                Objects.toString(job.title(),""),Objects.toString(job.company(),""),Objects.toString(job.city(),""),Objects.toString(job.salary(),"")),basic.reason()));
+        if (basic.eligible() && "boss".equals(job.platform())) checks.addAll(bossFilters.evaluate(job));
+        if (job.platformFilterReason()!=null && !job.platformFilterReason().isBlank())
+            checks.add(new RuleCheck("PLATFORM_FILTER","原平台配置",false,"",job.platformFilterReason(),"原平台配置："+job.platformFilterReason()));
+        var failed=checks.stream().filter(c -> !c.passed()).findFirst();
+        return new Match(failed.isEmpty(),failed.map(RuleCheck::reason).orElse(basic.reason()),checks);
+    }
+    private Match basicMatch(JobCandidate job) {
         if (!platforms.contains(job.platform())) return new Match(false,"平台不在此方案内");
         if (normal(job.jobId()).isEmpty()) return new Match(false,"岗位稳定编号缺失");
         if (normal(job.title()).isEmpty()) return new Match(false,"岗位名称缺失");

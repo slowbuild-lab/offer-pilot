@@ -46,6 +46,7 @@ import static com.getjobs.worker.boss.Locators.*;
 @Scope("prototype")
 @RequiredArgsConstructor
 public class Boss {
+    @Setter private com.getjobs.worker.utils.DeliveryPacingSession pacing;
 
     @Setter
     private Page page;
@@ -68,6 +69,9 @@ public class Boss {
     @Setter private String taskId;
     @Setter private java.util.function.Consumer<com.getjobs.application.service.JobCandidate> previewCallback;
     @Setter private java.util.function.Consumer<com.getjobs.application.service.JobCandidate> externalGuard;
+    @Setter private java.util.function.Consumer<com.getjobs.application.service.JobCandidate> contactCallback;
+    @Setter private java.util.function.Function<com.getjobs.application.service.JobCandidate,java.util.Optional<com.getjobs.application.service.JobProfile.RuleCheck>> cooldownCheck;
+    @Setter private java.util.function.BiConsumer<com.getjobs.application.service.JobCandidate,com.getjobs.application.service.JobProfile.Match> screeningCallback;
     private com.getjobs.application.service.JobCandidate externalCandidate;
     @Getter private String outcome = "COMPLETED";
     @Getter private String outcomeReason = "";
@@ -262,6 +266,8 @@ public class Boss {
             // 能把 playwright 线程占死几十分钟 —— 整个应用跟着卡住、投递任务也永远结束不了。
             boolean loadedAll = false;
             for (int i = 0; i < 300; i++) {
+                // Process the visible batch first. Paced mode loads more only after evaluating that batch.
+                if(pacing!=null){loadedAll=true;break;}
                 if (previewCallback != null) { loadedAll = true; break; }
                 // 停止检查：滚动加载过程中也要及时响应
                 if (shouldStopCallback != null && Boolean.TRUE.equals(shouldStopCallback.get())) {
@@ -287,6 +293,7 @@ public class Boss {
                         break;
                     }
                     // 按视口高度的90%渐进滚动，触发懒加载
+                    if(pacing!=null)pacing.read(true);
                     page.evaluate("() => window.scrollBy(0, Math.floor(window.innerHeight * 1.5))");
 
                     // 获取卡片数量变化，判断是否需要强制触底
@@ -337,7 +344,18 @@ public class Boss {
             // 3. 逐个遍历所有岗位
             Locator cards = page.locator("//ul[contains(@class, 'rec-job-list')]//li[contains(@class, 'job-card-box')]");
             int count = cards.count();
-            for (int i = 0; i < count; i++) {
+            for (int i = 0; i < count || pacing!=null&&count>0; i++) {
+                if(stopped())return;
+                if(pacing!=null&&i>=count){
+                    int previous=count;
+                    pacing.read(true,()->{
+                        page.locator("//ul[contains(@class, 'rec-job-list')]//li[contains(@class, 'job-card-box')]").last().scrollIntoViewIfNeeded();
+                        page.mouse().wheel(0,900);
+                    });
+                    long deadline=System.nanoTime()+5000000000L;
+                    while(countJobCards()<=previous&&System.nanoTime()<deadline){pacing.check();page.waitForTimeout(200);}
+                    count=countJobCards();if(count<=previous)break;
+                }
                 // 检查是否需要停止
                 if (shouldStopCallback != null && Boolean.TRUE.equals(shouldStopCallback.get())) {
                     progressCallback.accept("用户取消投递", i, count);
@@ -348,12 +366,14 @@ public class Boss {
                 cards = page.locator("//ul[contains(@class, 'rec-job-list')]//li[contains(@class, 'job-card-box')]");
                 // 在点击卡片时同步等待岗位详情接口返回，随后解析并入库
                 Response detailResp = null;
+                if(pacing!=null)pacing.read(false);
                 try {
                     if (i == 0 && count > 1) {
                         // 第一个卡片默认展开不会触发请求：先切到第二个，再切回第一个，并在返回第一个时监听响应
                         final Locator secondCard = cards.nth(1);
                         secondCard.click();
                         PlaywrightUtil.sleep(1);
+                        if(pacing!=null)pacing.read(false);
                         final Locator firstCard = cards.nth(0);
                         detailResp = page.waitForResponse(r -> {
                             try {
@@ -384,6 +404,7 @@ public class Boss {
                 String bossCompany = null;
                 String bossJobTitle = null;
                 String stableJobId = null;
+                String bossHrId = null;
 
                 if (detailResp != null) {
                     try {
@@ -402,6 +423,7 @@ public class Boss {
 
                         if (jobInfo != null) {
                             stableJobId = jobInfo.optString("encryptId", "");
+                            bossHrId = jobInfo.optString("encryptUserId", "");
                             jobName = jobInfo.optString("jobName", "");
                             jobSalary = jobInfo.optString("salaryDesc", "");
                             String city = jobInfo.optString("locationName", "");
@@ -417,6 +439,8 @@ public class Boss {
                             bossName = boss.optString("name", "");
                             bossActive = boss.optString("activeTimeDesc", "");
                             bossJobTitle = boss.optString("title", "");
+                            // Same fallbacks the detail parser uses; field placement varies by page version.
+                            if (bossHrId == null || bossHrId.isEmpty()) bossHrId = boss.optString("encryptUserId", boss.optString("encryptBossId", ""));
                         }
 
                         if (brand != null) {
@@ -427,26 +451,16 @@ public class Boss {
                     }
                 }
 
-                // 过滤（全部基于 JSON 字段），并输出过滤原因
-                if (jobName != null && blackJobs != null && blackJobs.stream().anyMatch(jobName::contains)) {
-                    String term = findMatchedTerm(blackJobs, jobName);
-                    log.info("被过滤：职位黑名单命中 | 公司：{} | 岗位：{} | 关键词：{}", bossCompany != null ? bossCompany : "", jobName, term != null ? term : "");
-                    continue;
-                }
-                // HR活跃状态过滤：当开启过滤开关且活跃描述包含“年”时，视为不活跃
-                boolean hrInactiveByYear = bossActive != null && bossActive.contains("年");
-                if (Boolean.TRUE.equals(config.getFilterDeadHR()) && hrInactiveByYear) {
-                    log.info("被过滤：HR活跃状态包含‘年’ | 公司：{} | 岗位：{} | 活跃：{}", bossCompany != null ? bossCompany : "", jobName != null ? jobName : "", bossActive);
-                    continue;
-                }
-                if (bossCompany != null && blackCompanies != null && blackCompanies.stream().anyMatch(bossCompany::contains)) {
-                    String term = findMatchedTerm(blackCompanies, bossCompany);
-                    log.info("被过滤：公司黑名单命中 | 公司：{} | 岗位：{} | 关键词：{}", bossCompany, jobName != null ? jobName : "", term != null ? term : "");
-                    continue;
-                }
-                if (bossJobTitle != null && blackRecruiters != null && blackRecruiters.stream().anyMatch(bossJobTitle::contains)) {
-                    String term = findMatchedTerm(blackRecruiters, bossJobTitle);
-                    log.info("被过滤：招聘者黑名单命中 | 公司：{} | 岗位：{} | 招聘者：{} | 关键词：{}", bossCompany != null ? bossCompany : "", jobName != null ? jobName : "", bossJobTitle, term != null ? term : "");
+                String platformReason=platformFilterReason(jobName,bossActive,bossCompany,bossJobTitle);
+                String jobLink=stableJobId==null?null:"https://www.zhipin.com/job_detail/"+stableJobId+".html";
+                var candidate=new com.getjobs.application.service.JobCandidate("boss",stableJobId,jobName,bossCompany,
+                        String.join(", ",tags),jobSalary,jobLink,jobDesc,platformReason)
+                        .withHr(bossHrId,bossActive);
+                if (previewCallback!=null) { previewCallback.accept(candidate); continue; }
+                var assessment=assessCandidate(candidate);
+                if (!assessment.eligible()) {
+                    log.info("被过滤：{} | 公司：{} | 岗位：{}",assessment.reason(),bossCompany,jobName);
+                    progressCallback.accept("跳过："+assessment.reason(),i+1,count);
                     continue;
                 }
 
@@ -458,6 +472,7 @@ public class Boss {
                 job.setJobArea(String.join(", ", tags));
                 job.setCompanyName(bossCompany != null ? bossCompany : "");
                 job.setRecruiter(bossName != null ? bossName : "");
+                job.setHrId(bossHrId != null ? bossHrId : "");
                 job.setJobInfo(jobDesc != null ? jobDesc : "");
 
                 // 输出
@@ -480,11 +495,12 @@ public class Boss {
                 } catch (Throwable ignore) {}
 
                 // 按 wait_time 降速，别把风控刷出来
-                pauseBetweenJobs();
+                if(pacing==null)pauseBetweenJobs();
 
                 // 停顿期间可能已经被弹到安全验证页，发现了就停下来等人工过验证，
                 // 而不是继续闷头点下去（继续点只会让后面的关键词全部失败）
                 if (isSecurityVerifyUrl(safeUrl())) {
+                    if(pacing!=null)pacing.pause("BOSS 要求安全验证，请人工处理后恢复");
                     log.warn("【{}】遍历过程中被跳转到安全验证页：{}", keyword, safeUrl());
                     if (progressCallback != null) {
                         progressCallback.accept("触发Boss安全校验，请在浏览器中手动完成验证", i + 1, count);
@@ -494,6 +510,7 @@ public class Boss {
             }
             log.info("【{}】岗位已投递完毕！已投递岗位数量:{}", keyword, postCount);
             } catch (Exception e) {
+                if(e instanceof com.getjobs.worker.utils.DeliveryPacingSession.Halt halt)throw halt;
                 if (previewCallback != null) throw new IllegalStateException("BOSS 预览采集失败，请检查浏览器页面", e);
                 if (!"COMPLETED".equals(outcome)) throw new IllegalStateException(outcomeReason, e);
                 log.error("【{}】处理失败，跳过该关键词继续下一个：{}", keyword, e.getMessage(), e);
@@ -808,6 +825,7 @@ public class Boss {
         Page.NavigateOptions options = new Page.NavigateOptions()
                 .setWaitUntil(com.microsoft.playwright.options.WaitUntilState.DOMCONTENTLOADED)
                 .setTimeout(45_000);
+        if(pacing!=null){pacing.read(true,()->page.navigate(url,options));settleAfterNavigation();return;}
         try {
             page.navigate(url, options);
         } catch (Exception first) {
@@ -1010,6 +1028,7 @@ public class Boss {
             return;
         }
         if (isSecurityVerifyUrl(url)) {
+            if(pacing!=null)pacing.pause("BOSS 要求安全验证，请人工处理后恢复");
             if (previewCallback != null) throw new IllegalStateException("BOSS 需要人工完成验证，预览未完成");
             log.warn("【{}】进入岗位列表时被跳转到验证页：{}", keyword, url);
             if (progressCallback != null) {
@@ -1026,11 +1045,41 @@ public class Boss {
         return shouldStopCallback != null && Boolean.TRUE.equals(shouldStopCallback.get());
     }
 
+    private String platformFilterReason(String title,String active,String company,String hrTitle) {
+        if (title!=null && blackJobs!=null && blackJobs.stream().anyMatch(title::contains)) return "职位黑名单命中："+findMatchedTerm(blackJobs,title);
+        if (Boolean.TRUE.equals(config.getFilterDeadHR()) && active!=null && active.contains("年")) return "HR活跃过滤："+active;
+        if (company!=null && blackCompanies!=null && blackCompanies.stream().anyMatch(company::contains)) return "公司黑名单命中："+findMatchedTerm(blackCompanies,company);
+        if (hrTitle!=null && blackRecruiters!=null && blackRecruiters.stream().anyMatch(hrTitle::contains)) return "招聘者职位黑名单命中："+findMatchedTerm(blackRecruiters,hrTitle);
+        return "";
+    }
+    private com.getjobs.application.service.JobProfile.Match assessCandidate(com.getjobs.application.service.JobCandidate candidate) {
+        var snapshot=config.getConfirmedProfile();
+        var match=snapshot==null?new com.getjobs.application.service.JobProfile.Match(true,"平台原配置条件通过"):snapshot.rules().match(candidate);
+        if (snapshot==null && candidate.platformFilterReason()!=null && !candidate.platformFilterReason().isBlank())
+            match=match.reject("PLATFORM_FILTER","原平台配置",candidate.platformFilterReason(),candidate.platformFilterReason());
+        // Contact history is database state, not a pure rule; evaluate it here so a blocked recruiter
+        // skips this job instead of aborting the whole task at the external gate.
+        if (snapshot!=null && cooldownCheck!=null) {
+            var check=cooldownCheck.apply(candidate);
+            if (check.isPresent()) match=match.with(check.get());
+        }
+        if (snapshot!=null && taskId!=null) {
+            try {
+                if (screeningCallback==null) throw new IllegalStateException("筛选记录未绑定");
+                screeningCallback.accept(candidate,match);
+            } catch(RuntimeException e) {
+                outcome="FAILED"; outcomeReason="筛选记录保存失败，已停止后续外发";
+                throw new IllegalStateException(outcomeReason,e);
+            }
+        }
+        return match;
+    }
+
     /** Every possibly external action is journaled before click; unknown results are never retried. */
     private boolean resumeSubmission(String keyword, Job job) {
         if (stopped()) return false;
         if (previewCallback != null) {
-            previewCallback.accept(new com.getjobs.application.service.JobCandidate("boss", extractEncryptId(job.getHref()), job.getJobName(), job.getCompanyName(), job.getJobArea(), job.getSalary(), job.getHref()));
+            previewCallback.accept(new com.getjobs.application.service.JobCandidate("boss", extractEncryptId(job.getHref()), job.getJobName(), job.getCompanyName(), job.getJobArea(), job.getSalary(), job.getHref(),job.getJobInfo()).withHr(job.getHrId(),null));
             return false;
         }
         if (Boolean.TRUE.equals(config.getDebugger())) return false;
@@ -1043,12 +1092,17 @@ public class Boss {
         String jobId = extractEncryptId(detailUrl);
         if (jobId == null || jobId.isBlank()) return false;
         if (job.getHref() != null && !jobId.equals(extractEncryptId(job.getHref()))) return false;
-        var candidate = new com.getjobs.application.service.JobCandidate("boss",jobId,job.getJobName(),job.getCompanyName(),job.getJobArea(),job.getSalary(),detailUrl);
-        if (config.getConfirmedProfile() != null && !config.getConfirmedProfile().rules().match(candidate).eligible()) return false;
+        var candidate = new com.getjobs.application.service.JobCandidate("boss",jobId,job.getJobName(),job.getCompanyName(),job.getJobArea(),job.getSalary(),detailUrl,job.getJobInfo())
+                .withHr(job.getHrId(),null);
+        if (!assessCandidate(candidate).eligible()) return false;
         externalCandidate = candidate;
         Page detail = page.context().newPage();
         String attempt = null;
+        boolean pacingConfirmed=false;
+        boolean contactStarted=false;
         try {
+            if(pacing!=null){pacing.usePage(detail);pacing.read(false,()->detail.navigate(detailUrl));}
+            else
             detail.navigate(detailUrl);
             PlaywrightUtil.sleep(1);
             Locator chat = detail.locator("a.btn-startchat, a.op-btn-chat");
@@ -1064,6 +1118,7 @@ public class Boss {
                 PlaywrightUtil.sleep(1);
             }
             if (!found || stopped()) return false;
+            if(pacing!=null&&!pacing.open(jobId,job.getJobName(),detailUrl))return false;
             checkExternal();
             String message = repeat ? config.randomRepeatChatMessage() : config.getSayHi();
             if (repeat && message == null) return false;
@@ -1073,6 +1128,11 @@ public class Boss {
             ledger.startAction(attempt, "CHAT");
             if (stopped()) { ledger.cancelActionBeforeClick(attempt,"CHAT"); return false; }
             checkArmedAction(attempt,"CHAT");
+            if(pacing!=null){
+                if(!jobId.equals(extractEncryptId(detail.url())))pacing.pause("排队期间 BOSS 岗位已变化，已取消外发");
+                pacing.arm();
+            }
+            contactStarted=true;
             chat.first().click();
             PlaywrightUtil.sleep(1);
             Locator inputs = detail.locator("div#chat-input.chat-input[contenteditable='true'], textarea.input-area");
@@ -1100,9 +1160,12 @@ public class Boss {
             ledger.startAction(attempt, "TEXT");
             if (stopped()) { ledger.cancelActionBeforeClick(attempt,"TEXT"); return false; }
             checkArmedAction(attempt,"TEXT");
+            if(pacing!=null)pacing.nextAction();
+            checkArmedAction(attempt,"TEXT");
             send.first().click();
             boolean confirmed = BossMessageEvidence.waitForNew(detail, message, count);
             ledger.finishAction(attempt, "TEXT", confirmed);
+            pacingConfirmed=confirmed;
             if (confirmed) {
                 String userId = encryptIdToUserId.get(jobId);
                 if (userId != null) bossService.updateDeliveryStatus(jobId, userId, "已投递");
@@ -1112,18 +1175,43 @@ public class Boss {
                 checkExternal();
                 ledger.startAction(attempt, "IMAGE");
                 if (stopped()) { ledger.cancelActionBeforeClick(attempt,"IMAGE"); return confirmed; }
-                ledger.finishAction(attempt, "IMAGE", sendImageResume(detail));
+                if(pacing!=null)pacing.nextAction();
+                checkArmedAction(attempt,"IMAGE");
+                pacingConfirmed=false;
+                boolean imageConfirmed=sendImageResume(detail);
+                ledger.finishAction(attempt, "IMAGE", imageConfirmed);
+                pacingConfirmed=imageConfirmed;
             }
             return confirmed;
         } finally {
-            try { if (attempt != null) ledger.settle(attempt); }
-            finally { detail.close(); }
+            try { if(contactStarted)recordContact(externalCandidate); }
+            finally {
+                try { if (attempt != null) ledger.settle(attempt); }
+                finally {
+                    try {if(pacing!=null)pacing.complete(pacingConfirmed);}
+                    finally {detail.close();if(pacing!=null)pacing.usePage(page);}
+                }
+            }
         }
     }
 
     private void checkExternal() {
         if (stopped()) throw new IllegalStateException("任务已停止，禁止外发");
         if (externalGuard != null) externalGuard.accept(externalCandidate);
+    }
+    /**
+     * Contact history is written after a greeting was actually issued. An unconfirmed send still counts,
+     * because the recruiter may already have seen it; losing the record would silently disable the cooldown.
+     */
+    private void recordContact(com.getjobs.application.service.JobCandidate candidate) {
+        if (contactCallback == null || candidate == null) return;
+        try {
+            contactCallback.accept(candidate);
+        } catch (RuntimeException e) {
+            outcome = "FAILED"; outcomeReason = "接触记录写入失败，已停止后续外发";
+            if(pacing!=null)pacing.pause(outcomeReason);
+            throw new IllegalStateException(outcomeReason, e);
+        }
     }
     private void checkArmedAction(String attempt,String action) {
         try { checkExternal(); }
