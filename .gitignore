@@ -50,6 +50,8 @@ cookies/
 .env
 chromedriver
 *.jpg
+# 已脱敏的公开文档截图；个人图片简历继续按下方规则忽略
+!/docs/public/images/screenshots/*.jpg
 !docs/public/images/aliPay.jpg
 !docs/public/images/wechatpay.jpg
 # 运行时上传的个人图片简历，绝不能提交
