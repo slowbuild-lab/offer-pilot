@@ -103,8 +103,8 @@ export default function Sidebar() {
         <div className="flex items-center gap-3 mb-2">
           <span className="text-4xl leading-none">🍀</span>
           <div>
-            <h1 className="text-xl font-bold text-white">Get Jobs</h1>
-            <p className="text-white dark:text-manatee text-sm">求职作战台</p>
+            <h1 className="text-xl font-bold text-white">OfferPilot</h1>
+            <p className="text-white dark:text-manatee text-sm">求职领航</p>
           </div>
         </div>
 

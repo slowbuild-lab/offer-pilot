@@ -1,4 +1,4 @@
-# 求职作战台 · Get Jobs
+# 求职领航 · OfferPilot
 
 把分散的求职条件、平台任务和投递结果放到一个本机工作台中，减少重复操作，也让每次外发有记录、遇到异常能停下来。
 
@@ -56,7 +56,7 @@
 
 ```bash
 git clone https://github.com/slowbuild-lab/offer-pilot.git
-cd get_jobs
+cd offer-pilot
 ```
 
 首次还需准备兼容的 `db/getjobs.db`。当前仓库不分发个人数据库，也未提供完整的空库初始化包；不要把空 SQLite 文件当成可用配置库。准备方式与升级要求见 [本机运行说明](本机运行说明.md)。

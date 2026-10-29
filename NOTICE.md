@@ -1,6 +1,6 @@
 # 项目来源与授权说明
 
-本仓库为 [slowbuild-lab/offer-pilot](https://github.com/slowbuild-lab/offer-pilot)，当前产品名称为“求职作战台”。项目介绍、使用流程与文档站已按本仓库实际行为重新编写。
+本仓库为 [slowbuild-lab/offer-pilot](https://github.com/slowbuild-lab/offer-pilot)，当前产品名称为“求职领航”。本仓库以独立仓库维护，保留原有 Git 提交历史。项目介绍、使用流程与文档站已按本仓库实际行为重新编写。
 
 ## 代码来源
 

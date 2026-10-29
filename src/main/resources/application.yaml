@@ -1,11 +1,11 @@
 spring:
   application:
-    name: get_jobs
+    name: offer-pilot
   profiles:
     active: dev
   info:
     app:
-      name: Get Jobs
+      name: OfferPilot
       version: 2.0.1
       description: https://github.com/slowbuild-lab/offer-pilot
   banner:

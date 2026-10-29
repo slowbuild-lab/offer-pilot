@@ -1,7 +1,7 @@
 ---
 layout: home
 hero:
-  name: "求职作战台"
+  name: "求职领航"
   text: "筛选有依据，投递有记录"
   tagline: "本机管理求职方案与四平台任务，控制节奏，核实结果。"
   actions:

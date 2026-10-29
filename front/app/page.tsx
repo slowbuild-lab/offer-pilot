@@ -191,7 +191,7 @@ export default function WorkbenchPage() {
     <div className="space-y-6">
       <PageHeader
         icon={<BiPlay className="text-2xl" />}
-        title="求职作战台"
+        title="求职领航"
         subtitle="并行投递总览，每 2 秒刷新"
         iconClass="text-white"
         accentBgClass="bg-indigo-500"

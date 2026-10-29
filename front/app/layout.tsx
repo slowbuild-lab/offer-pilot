@@ -14,7 +14,7 @@ export default function RootLayout({
   return (
     <html lang="zh-CN" suppressHydrationWarning>
       <head>
-        <title>Get Jobs - 求职作战台</title>
+        <title>OfferPilot - 求职领航</title>
         <meta name="description" content="多平台并行投递总览与平台配置管理" />
         <link
           rel="icon"

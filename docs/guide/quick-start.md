@@ -8,7 +8,7 @@
 
 ```bash
 git clone https://github.com/slowbuild-lab/offer-pilot.git
-cd get_jobs
+cd offer-pilot
 cd front
 npm ci
 cd ..

@@ -1,7 +1,7 @@
 {
-  "name": "getjobs-docs",
+  "name": "offer-pilot-docs",
   "version": "1.0.0",
-  "description": "求职作战台：本机方案管理、四平台任务与投递保护文档",
+  "description": "求职领航：本机方案管理、四平台任务与投递保护文档",
   "type": "module",
   "scripts": {
     "docs:dev": "vitepress dev",
