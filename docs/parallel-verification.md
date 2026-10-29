@@ -1,6 +1,6 @@
 # 多平台并行验收记录（2026-10-21）
 
-本文只记录**本轮实际执行**的检查。此前的智联增强验收（111 项）见 [tasks/phase1-verification.md](../tasks/phase1-verification.md)，不能作为本次并行的证据。
+本文只记录**本轮实际执行**的检查。此前的智联增强验收（111 项）见 [tasks/phase1-verification.md](https://github.com/slowbuild-lab/offer-pilot/blob/main/tasks/phase1-verification.md)，不能作为本次并行的证据。
 
 ## 验证方式
 

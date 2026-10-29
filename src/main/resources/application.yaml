@@ -7,7 +7,7 @@ spring:
     app:
       name: Get Jobs
       version: 2.0.1
-      description: https://github.com/loks666/get_jobs
+      description: https://github.com/slowbuild-lab/offer-pilot
   banner:
     charset: UTF-8
     location: classpath:banner.txt
