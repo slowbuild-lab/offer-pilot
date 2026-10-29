@@ -2,8 +2,6 @@
 
 把分散的求职条件、平台任务和投递结果放到一个本机工作台中，减少重复操作，也让每次外发有记录、遇到异常能停下来。
 
-本仓库由 [slowbuild-lab](https://github.com/slowbuild-lab) 维护。当前重点是**可解释筛选、可控投递、结果核实和本地数据保护**。
-
 [本机运行](本机运行说明.md) · [功能说明](ENHANCEMENTS.md) · [更新记录](CHANGELOG.md) · [问题反馈](https://github.com/slowbuild-lab/offer-pilot/issues) · [来源与授权](NOTICE.md)
 
 ## 能做什么
